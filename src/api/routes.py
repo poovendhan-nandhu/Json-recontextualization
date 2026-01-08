@@ -867,12 +867,8 @@ async def run_pipeline_streaming(request: PipelineRequest):
     Run full pipeline with streaming progress updates.
 
     Returns SSE events for each stage completion.
-    Sends heartbeat every 10s to prevent Heroku timeout.
     """
     async def event_generator():
-        import asyncio
-        from collections import deque
-
         try:
             from src.graph.nodes import run_pipeline_streaming
 
@@ -887,62 +883,19 @@ async def run_pipeline_streaming(request: PipelineRequest):
 
             yield f"data: {json.dumps({'event': 'start', 'message': 'Starting 7-stage pipeline'})}\n\n"
 
-            # Use queue to collect states from pipeline
-            state_queue = asyncio.Queue()
-            pipeline_done = asyncio.Event()
-            final_state = {}
-            pipeline_error = None
+            last_stage = None
+            async for state in run_pipeline_streaming(
+                input_json=request.input_json,
+                selected_scenario=selected_scenario,
+                max_retries=request.max_retries,
+            ):
+                current_stage = state.get("current_stage", "unknown")
+                if current_stage != last_stage:
+                    yield f"data: {json.dumps({'event': 'stage_complete', 'stage': current_stage, 'timing_ms': state.get('stage_timings', {}).get(current_stage, 0)})}\n\n"
+                    last_stage = current_stage
 
-            async def run_pipeline():
-                nonlocal final_state, pipeline_error
-                try:
-                    last_stage = None
-                    async for state in run_pipeline_streaming(
-                        input_json=request.input_json,
-                        selected_scenario=selected_scenario,
-                        max_retries=request.max_retries,
-                    ):
-                        current_stage = state.get("current_stage", "unknown")
-                        if current_stage != last_stage:
-                            await state_queue.put({
-                                'event': 'stage_complete',
-                                'stage': current_stage,
-                                'timing_ms': state.get('stage_timings', {}).get(current_stage, 0)
-                            })
-                            last_stage = current_stage
-                        final_state = state
-                except Exception as e:
-                    import traceback
-                    pipeline_error = {'message': str(e), 'traceback': traceback.format_exc()}
-                finally:
-                    pipeline_done.set()
-
-            # Start pipeline in background
-            pipeline_task = asyncio.create_task(run_pipeline())
-
-            # Send heartbeats while waiting for pipeline
-            heartbeat_count = 0
-            while not pipeline_done.is_set():
-                try:
-                    # Check for new states (non-blocking with timeout)
-                    state_event = await asyncio.wait_for(state_queue.get(), timeout=10.0)
-                    yield f"data: {json.dumps(state_event)}\n\n"
-                except asyncio.TimeoutError:
-                    # No state update - send heartbeat to keep connection alive
-                    heartbeat_count += 1
-                    yield f"data: {json.dumps({'event': 'heartbeat', 'count': heartbeat_count})}\n\n"
-
-            # Drain any remaining states in queue
-            while not state_queue.empty():
-                state_event = await state_queue.get()
-                yield f"data: {json.dumps(state_event)}\n\n"
-
-            # Check for errors
-            if pipeline_error:
-                yield f"data: {json.dumps({'event': 'error', **pipeline_error})}\n\n"
-            else:
-                # Final result
-                yield f"data: {json.dumps({'event': 'complete', 'final_status': final_state.get('final_status'), 'total_runtime_ms': final_state.get('total_runtime_ms')})}\n\n"
+            # Final result
+            yield f"data: {json.dumps({'event': 'complete', 'final_status': state.get('final_status'), 'total_runtime_ms': state.get('total_runtime_ms')})}\n\n"
 
         except Exception as e:
             import traceback
