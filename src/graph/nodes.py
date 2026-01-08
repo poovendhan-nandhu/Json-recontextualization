@@ -300,15 +300,32 @@ async def alignment_node(state: PipelineState) -> PipelineState:
 
             # Prepare shards for regeneration
             shards_to_regenerate = {}
-            for shard_id, content in adapted_shards.items():
-                shard_lower = shard_id.lower()
-                needs_regen = any(
-                    focus.lower() in shard_lower or shard_lower in focus.lower()
-                    for focus in feedback.focus_shards
-                )
-                if needs_regen:
-                    shards_to_regenerate[shard_id] = content
-                    logger.info(f"  → Will regenerate: {shard_id}")
+
+            # Handle both list of Shard objects and dict formats
+            if isinstance(adapted_shards, list):
+                # List of Shard objects
+                for shard in adapted_shards:
+                    shard_id = shard.id if hasattr(shard, 'id') else str(shard)
+                    shard_content = shard.content if hasattr(shard, 'content') else shard
+                    shard_lower = shard_id.lower()
+                    needs_regen = any(
+                        focus.lower() in shard_lower or shard_lower in focus.lower()
+                        for focus in feedback.focus_shards
+                    )
+                    if needs_regen:
+                        shards_to_regenerate[shard_id] = shard_content
+                        logger.info(f"  → Will regenerate: {shard_id}")
+            else:
+                # Dict format
+                for shard_id, content in adapted_shards.items():
+                    shard_lower = shard_id.lower()
+                    needs_regen = any(
+                        focus.lower() in shard_lower or shard_lower in focus.lower()
+                        for focus in feedback.focus_shards
+                    )
+                    if needs_regen:
+                        shards_to_regenerate[shard_id] = content
+                        logger.info(f"  → Will regenerate: {shard_id}")
 
             if not shards_to_regenerate:
                 logger.info("No matching shards found for regeneration")
@@ -333,7 +350,15 @@ async def alignment_node(state: PipelineState) -> PipelineState:
             regen_count = 0
             for shard_id, (new_content, mappings) in regenerated.items():
                 if new_content and new_content != shards_to_regenerate.get(shard_id):
-                    adapted_shards[shard_id] = new_content
+                    # Handle both list and dict formats
+                    if isinstance(adapted_shards, list):
+                        # Find and update shard in list
+                        for shard in adapted_shards:
+                            if hasattr(shard, 'id') and shard.id == shard_id:
+                                shard.content = new_content
+                                break
+                    else:
+                        adapted_shards[shard_id] = new_content
                     regen_count += 1
                     logger.info(f"  ✅ Regenerated: {shard_id}")
 
