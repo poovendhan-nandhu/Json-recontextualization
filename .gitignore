@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+.venv_test/
+venv/
+*.log
+*.json
+!package.json
+.DS_Store
+*.db
+chromadb/
+chroma_db/
+node_modules/
+.idea/
+*.egg-info/

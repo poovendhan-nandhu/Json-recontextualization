@@ -1,0 +1,16 @@
+[tool.poetry]
+name = "fastapi-langgraph-app"
+version = "0.1.0"
+description = "A FastAPI application integrated with LangGraph."
+authors = ["Your Name <youremail@example.com>"]
+license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+fastapi = "^0.75.0"
+uvicorn = "^0.17.0"
+langgraph = "^0.1.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
