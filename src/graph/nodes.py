@@ -194,11 +194,25 @@ async def adaptation_node(state: PipelineState) -> PipelineState:
             logger.warning(f"RAG context failed: {e}")
             state["rag_context"] = {"industry": state["industry"]}
 
+        # ⭐ KLO ALIGNMENT FIX - Ensure questions map to KLOs
+        # This runs AFTER adaptation but BEFORE alignment checking
+        try:
+            from ..stages.fixers import fix_klo_alignment
+            logger.info("Running KLO Alignment Fixer...")
+            klo_fix_context = {
+                "global_factsheet": result.global_factsheet,
+            }
+            fixed_json = await fix_klo_alignment(result.adapted_json, klo_fix_context)
+            logger.info("KLO Alignment Fixer complete")
+        except Exception as e:
+            logger.warning(f"KLO Alignment Fixer failed, using original: {e}")
+            fixed_json = result.adapted_json
+
         # Update shard collection with adapted data
         # The adaptation engine returns the merged JSON - we need to re-shard
         # to get adapted_shards for downstream stages
         from ..stages import shard_json
-        adapted_collection = shard_json(result.adapted_json)
+        adapted_collection = shard_json(fixed_json)
         state["adapted_shards"] = adapted_collection.shards
         state["shard_collection"] = adapted_collection
 

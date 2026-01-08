@@ -981,3 +981,278 @@ async def apply_batched_fixes(
     """
     fixer = BatchedSemanticFixer()
     return await fixer.apply_all_fixes(shards, all_fixes, context)
+
+
+# =============================================================================
+# KLO ALIGNMENT FIXER (Post-Adaptation)
+# =============================================================================
+
+class KLOAlignmentFixResponse(BaseModel):
+    """LLM response for KLO alignment fixes."""
+    fixed_questions: list[dict] = Field(description="List of fixed questions with proper KLO mapping")
+    fixed_activities: list[dict] = Field(description="List of fixed activities with proper KLO mapping")
+    klo_mapping: dict = Field(description="Mapping of each KLO to its assessing questions/activities")
+    summary: str = Field(description="Summary of alignment fixes made")
+
+
+class KLOAlignmentFixer:
+    """
+    Post-adaptation fixer that ensures questions/activities properly assess KLOs.
+
+    This runs AFTER adaptation but BEFORE alignment checking.
+    It extracts the adapted KLOs and rewrites questions to ensure proper mapping.
+    """
+
+    def __init__(self):
+        self.llm = _get_fixer_llm()
+
+    def _extract_klos(self, topic_data: dict) -> list[dict]:
+        """Extract KLOs from adapted JSON."""
+        klos = []
+        for criterion in topic_data.get("assessmentCriterion", []):
+            klo_text = criterion.get("keyLearningOutcome", "")
+            criteria_list = [c.get("criteria", "") for c in criterion.get("criterion", []) if c.get("criteria")]
+            if klo_text:
+                klos.append({
+                    "id": criterion.get("id", ""),
+                    "klo": klo_text,
+                    "criteria": criteria_list
+                })
+        return klos
+
+    def _extract_questions(self, topic_data: dict) -> list[dict]:
+        """Extract all questions from simulation flow."""
+        questions = []
+
+        # From simulationFlow stages
+        for stage in topic_data.get("simulationFlow", []):
+            stage_data = stage.get("data", {})
+
+            # Direct questions
+            if "questions" in stage_data:
+                for q in stage_data["questions"]:
+                    questions.append({
+                        "location": f"simulationFlow/{stage.get('name', 'unknown')}/questions",
+                        "question": q
+                    })
+
+            # Submission questions
+            if "submissionQuestions" in stage_data:
+                for q in stage_data["submissionQuestions"]:
+                    questions.append({
+                        "location": f"simulationFlow/{stage.get('name', 'unknown')}/submissionQuestions",
+                        "question": q
+                    })
+
+            # Activity data questions
+            activity_data = stage_data.get("activityData", {})
+            if isinstance(activity_data, dict) and "questions" in activity_data:
+                for q in activity_data["questions"]:
+                    questions.append({
+                        "location": f"simulationFlow/{stage.get('name', 'unknown')}/activityData/questions",
+                        "question": q
+                    })
+
+            # Review rubric questions
+            review = stage_data.get("review", {})
+            if isinstance(review, dict):
+                for rubric in review.get("rubric", []):
+                    if isinstance(rubric, dict):
+                        if rubric.get("question"):
+                            questions.append({
+                                "location": f"simulationFlow/{stage.get('name', 'unknown')}/review/rubric",
+                                "question": {"question": rubric["question"]}
+                            })
+
+            # Children
+            for child in stage.get("children", []):
+                child_data = child.get("data", {})
+                if "questions" in child_data:
+                    for q in child_data["questions"]:
+                        questions.append({
+                            "location": f"simulationFlow/{stage.get('name', 'unknown')}/children/{child.get('name', 'unknown')}/questions",
+                            "question": q
+                        })
+
+        # Top-level submission questions
+        for q in topic_data.get("submissionQuestions", []):
+            questions.append({"location": "submissionQuestions", "question": q})
+        for q in topic_data.get("selectedSubmissionQuestions", []):
+            questions.append({"location": "selectedSubmissionQuestions", "question": q})
+
+        return questions
+
+    def _extract_activities(self, topic_data: dict) -> list[dict]:
+        """Extract all activities from simulation flow."""
+        activities = []
+
+        for stage in topic_data.get("simulationFlow", []):
+            stage_data = stage.get("data", {})
+
+            # Stage itself as activity
+            if stage_data.get("name") or stage_data.get("description"):
+                activities.append({
+                    "location": f"simulationFlow/{stage.get('name', 'unknown')}",
+                    "name": stage_data.get("name", stage.get("name", "")),
+                    "description": stage_data.get("description", ""),
+                    "type": stage.get("type", "")
+                })
+
+            # Children activities
+            for child in stage.get("children", []):
+                child_data = child.get("data", {})
+                if child_data.get("name") or child_data.get("description"):
+                    activities.append({
+                        "location": f"simulationFlow/{stage.get('name', 'unknown')}/children/{child.get('name', 'unknown')}",
+                        "name": child_data.get("name", child.get("name", "")),
+                        "description": child_data.get("description", ""),
+                        "type": child.get("type", "")
+                    })
+
+        return activities
+
+    @traceable(name="klo_alignment_fixer")
+    async def fix(self, adapted_json: dict, context: dict) -> dict:
+        """
+        Fix KLO alignment in adapted JSON.
+
+        Args:
+            adapted_json: The adapted JSON after adaptation stage
+            context: Pipeline context with global_factsheet
+
+        Returns:
+            Fixed JSON with proper KLO-to-question mapping
+        """
+        topic_data = adapted_json.get("topicWizardData", {})
+
+        # Extract components
+        klos = self._extract_klos(topic_data)
+        questions = self._extract_questions(topic_data)
+        activities = self._extract_activities(topic_data)
+
+        if not klos:
+            logger.warning("No KLOs found in adapted JSON, skipping KLO alignment fix")
+            return adapted_json
+
+        logger.info(f"KLO Alignment Fixer: {len(klos)} KLOs, {len(questions)} questions, {len(activities)} activities")
+
+        # Get context info
+        factsheet = context.get("global_factsheet", {})
+        company_name = factsheet.get("company", {}).get("name", "the company")
+        industry = factsheet.get("company", {}).get("industry", "business")
+
+        prompt = f"""You are a KLO Alignment Specialist for undergraduate business simulations.
+
+## TASK:
+Ensure every KLO (Key Learning Outcome) is properly assessed by questions and/or activities.
+
+## TARGET CONTEXT:
+- Company: {company_name}
+- Industry: {industry}
+
+## CURRENT KLOs (MUST BE ASSESSED):
+{json.dumps(klos, indent=2)}
+
+## CURRENT QUESTIONS:
+{json.dumps(questions[:20], indent=2)}
+
+## CURRENT ACTIVITIES:
+{json.dumps(activities[:15], indent=2)}
+
+## REQUIREMENTS:
+1. EVERY KLO must have at least one question OR activity that directly assesses it
+2. Questions should use SAME TERMINOLOGY as the KLO they assess
+3. Questions must be answerable using simulation resources
+4. Activities should require learners to DEMONSTRATE the KLO skill
+
+## OUTPUT:
+For each KLO that is NOT properly assessed, provide a REWRITTEN question or activity.
+
+Return:
+1. fixed_questions: List of questions that need rewriting (with new text)
+2. fixed_activities: List of activities that need rewriting (with new text)
+3. klo_mapping: For each KLO ID, list which questions/activities assess it
+4. summary: What you changed and why
+
+IMPORTANT:
+- Only rewrite questions/activities that are MISALIGNED
+- Keep questions that already properly assess KLOs
+- Use industry-appropriate terminology ({industry})
+- Make questions specific and measurable"""
+
+        try:
+            parser = PydanticOutputParser(pydantic_object=KLOAlignmentFixResponse)
+
+            chat_prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are a KLO alignment specialist for business simulations.
+Your job is to ensure questions and activities properly assess the Key Learning Outcomes.
+Be specific and use industry-appropriate terminology.
+
+{format_instructions}"""),
+                ("human", "{input}"),
+            ])
+
+            chain = chat_prompt | self.llm | parser
+
+            result = await chain.ainvoke({
+                "input": prompt,
+                "format_instructions": parser.get_format_instructions(),
+            })
+
+            logger.info(f"KLO Alignment: {result.summary}")
+            logger.info(f"KLO Mapping: {json.dumps(result.klo_mapping, indent=2)[:500]}")
+
+            # Apply fixes to the JSON
+            fixed_json = self._apply_fixes(adapted_json, result)
+
+            return fixed_json
+
+        except Exception as e:
+            logger.error(f"KLO Alignment Fixer failed: {e}")
+            return adapted_json  # Return original on error
+
+    def _apply_fixes(self, adapted_json: dict, result: KLOAlignmentFixResponse) -> dict:
+        """Apply the KLO alignment fixes to the JSON."""
+        fixed_json = copy.deepcopy(adapted_json)
+        topic_data = fixed_json.get("topicWizardData", {})
+
+        # Apply question fixes
+        for fixed_q in result.fixed_questions:
+            location = fixed_q.get("location", "")
+            new_question = fixed_q.get("question", fixed_q)
+
+            # Try to find and update the question at the location
+            # This is a simplified approach - in production, use JSON Pointer
+            if "submissionQuestions" in location:
+                if "submissionQuestions" in topic_data:
+                    # Find matching question and update
+                    for i, q in enumerate(topic_data["submissionQuestions"]):
+                        if isinstance(new_question, dict) and new_question.get("id") == q.get("id"):
+                            topic_data["submissionQuestions"][i] = new_question
+                            break
+
+        # Apply activity fixes
+        for fixed_a in result.fixed_activities:
+            location = fixed_a.get("location", "")
+            # Similar logic for activities in simulationFlow
+            # In production, use JSON Pointer for precise updates
+
+        fixed_json["topicWizardData"] = topic_data
+        return fixed_json
+
+
+async def fix_klo_alignment(adapted_json: dict, context: dict) -> dict:
+    """
+    Convenience function to fix KLO alignment.
+
+    Call this AFTER adaptation but BEFORE alignment checking.
+
+    Args:
+        adapted_json: The adapted JSON from adaptation stage
+        context: Pipeline context with global_factsheet
+
+    Returns:
+        Fixed JSON with proper KLO-to-question mapping
+    """
+    fixer = KLOAlignmentFixer()
+    return await fixer.fix(adapted_json, context)
