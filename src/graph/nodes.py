@@ -379,7 +379,9 @@ async def alignment_node(state: PipelineState) -> PipelineState:
     except Exception as e:
         logger.error(f"Alignment check failed: {e}")
         add_error(state, "alignment", str(e), is_fatal=False)
-        state["alignment_passed"] = True  # Continue pipeline
+        # Don't override alignment_passed if we already have a valid score
+        if "alignment_score" not in state or state["alignment_score"] == 0:
+            state["alignment_passed"] = True  # Only default to True if no score yet
 
     return state
 
