@@ -740,21 +740,12 @@ def should_retry_compliance(state: PipelineState) -> str:
     """
     Decide if compliance loop should retry.
 
-    NOTE: This is a READ-ONLY function - do NOT mutate state here!
-    State mutations don't persist in LangGraph routing functions.
-    The retry_count is incremented in finisher_node.
+    NOTE: Retry loop disabled to avoid recursion limit issues.
+    Always goes to human_approval now.
     """
-    if state.get("compliance_passed", False):
-        return "human_approval"
-
-    # retry_count was already incremented in finisher_node
-    retry_count = state.get("retry_count", 0)
-    max_retries = state.get("max_retries", 3)
-
-    if retry_count < max_retries:
-        return "validation"  # Go back to validation
-
-    return "human_approval"  # Max retries reached, need human review
+    # Always go to human_approval - no retry loop
+    # This avoids LangGraph recursion limit issues
+    return "human_approval"
 
 
 def should_abort(state: PipelineState) -> str:
