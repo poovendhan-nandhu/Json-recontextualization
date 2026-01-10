@@ -208,6 +208,10 @@ async def adaptation_node(state: PipelineState) -> PipelineState:
             logger.warning(f"KLO Alignment Fixer failed, using original: {e}")
             fixed_json = result.adapted_json
 
+        # Sanitize JSON to remove invalid UTF-8 surrogates before re-sharding
+        from ..utils.gemini_client import sanitize_for_json
+        fixed_json = sanitize_for_json(fixed_json)
+
         # Update shard collection with adapted data
         # The adaptation engine returns the merged JSON - we need to re-shard
         # to get adapted_shards for downstream stages
