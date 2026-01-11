@@ -53,16 +53,20 @@ class AdaptationEngine:
     - PARALLEL processing of unlocked shards
     - Locked shards NEVER sent to LLM
     - Statistics tracking for cost/performance
+    - PER-SHARD RAG: Each shard gets similar examples from its type collection
     """
 
-    def __init__(self, rag_retriever=None, rag_context: str = ""):
+    def __init__(self, rag_retriever=None, rag_context: str = "", use_per_shard_rag: bool = True):
         """
         Args:
             rag_retriever: Optional RAG retriever for context (dynamic)
             rag_context: Optional pre-built RAG context string (static)
+            use_per_shard_rag: Enable per-shard-type RAG retrieval (default True)
         """
         self.rag_retriever = rag_retriever
         self._static_rag_context = rag_context  # Pre-built context
+        self.use_per_shard_rag = use_per_shard_rag
+        self._shard_examples_cache = {}  # Cache for per-shard examples
 
     async def adapt(
         self,
@@ -283,7 +287,7 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
         )
 
     async def _get_rag_context(self, target_scenario: str) -> str:
-        """Query RAG for relevant context."""
+        """Query RAG for relevant context (legacy method)."""
         try:
             results = self.rag_retriever.retrieve_context(
                 query=target_scenario,
@@ -296,6 +300,60 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
             logger.warning(f"RAG retrieval failed: {e}")
         return ""
 
+    async def _get_per_shard_rag_examples(
+        self,
+        shard_names: list[str],
+        target_scenario: str,
+        industry: str = None,
+    ) -> dict[str, str]:
+        """
+        Retrieve similar examples for each shard type.
+
+        This is the KEY RAG method - it retrieves similar content from
+        the same shard type across indexed simulations to guide generation.
+
+        Args:
+            shard_names: List of shard IDs to get examples for
+            target_scenario: Target scenario description for similarity search
+            industry: Target industry for filtering
+
+        Returns:
+            Dict mapping shard_id to formatted RAG context string
+        """
+        from ..rag import SimulationRetriever
+
+        try:
+            retriever = SimulationRetriever()
+
+            # Get examples for all shards
+            all_examples = retriever.retrieve_all_shard_examples(
+                target_scenario=target_scenario,
+                shard_names=shard_names,
+                n_results_per_shard=2,  # 2 examples per shard type
+                exclude_simulation=None,  # Include all indexed simulations
+                industry=industry,
+            )
+
+            # Format examples for each shard
+            shard_contexts = {}
+            for shard_name, examples in all_examples.items():
+                if examples:
+                    formatted = retriever.format_examples_for_prompt(
+                        examples,
+                        max_chars=4000,  # Limit per-shard context
+                    )
+                    shard_contexts[shard_name] = formatted
+                    logger.debug(f"RAG: {shard_name} got {len(examples)} examples ({len(formatted)} chars)")
+                else:
+                    shard_contexts[shard_name] = ""
+
+            logger.info(f"Per-shard RAG: Retrieved examples for {len(shard_contexts)} shards")
+            return shard_contexts
+
+        except Exception as e:
+            logger.warning(f"Per-shard RAG retrieval failed: {e}")
+            return {name: "" for name in shard_names}
+
     async def _adapt_shards_parallel(
         self,
         shards: list,
@@ -305,6 +363,7 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
         Adapt multiple shards in PARALLEL using asyncio.gather().
 
         All shards receive the SAME global_factsheet for consistency.
+        Each shard receives UNIQUE RAG examples from its shard type collection.
 
         Args:
             shards: List of unlocked shards to adapt
@@ -313,13 +372,46 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
         Returns:
             (list of adapted shards, combined entity map)
         """
-        # Create tasks for all shards
-        tasks = [
-            self._adapt_single_shard(shard, context)
-            for shard in shards
-        ]
+        # =====================================================================
+        # STEP 1: Get per-shard RAG examples (if enabled)
+        # =====================================================================
+        shard_rag_contexts = {}
+        if self.use_per_shard_rag:
+            shard_names = [s.id for s in shards]
+            target_scenario = context.get("target_scenario", "")
+            industry = context.get("global_factsheet", {}).get("industry", None)
 
-        # Run ALL tasks in parallel
+            logger.info(f"Retrieving per-shard RAG examples for {len(shard_names)} shards...")
+            shard_rag_contexts = await self._get_per_shard_rag_examples(
+                shard_names=shard_names,
+                target_scenario=target_scenario,
+                industry=industry,
+            )
+
+            # Cache for potential reuse
+            self._shard_examples_cache = shard_rag_contexts
+
+        # =====================================================================
+        # STEP 2: Create tasks with per-shard context
+        # =====================================================================
+        tasks = []
+        for shard in shards:
+            # Build shard-specific context
+            shard_context = context.copy()
+
+            # Add per-shard RAG examples (if available)
+            per_shard_rag = shard_rag_contexts.get(shard.id, "")
+            if per_shard_rag:
+                # Combine static RAG context with per-shard examples
+                existing_rag = shard_context.get("rag_context", "")
+                shard_context["rag_context"] = f"{existing_rag}\n\n{per_shard_rag}".strip()
+                shard_context["per_shard_rag_examples"] = per_shard_rag
+
+            tasks.append(self._adapt_single_shard(shard, shard_context))
+
+        # =====================================================================
+        # STEP 3: Run ALL tasks in parallel
+        # =====================================================================
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         # Process results
@@ -475,6 +567,7 @@ async def adapt_simulation(
     input_json: dict,
     target_scenario_index: int,
     rag_retriever=None,
+    use_per_shard_rag: bool = True,
 ) -> AdaptationResult:
     """
     Adapt simulation to new scenario with parallel processing.
@@ -482,10 +575,14 @@ async def adapt_simulation(
     Args:
         input_json: Original simulation JSON
         target_scenario_index: Target scenario index (0-36)
-        rag_retriever: Optional RAG retriever
+        rag_retriever: Optional RAG retriever for legacy context
+        use_per_shard_rag: Enable per-shard-type RAG retrieval (default True)
 
     Returns:
-        AdaptationResult
+        AdaptationResult with adapted JSON and per-shard RAG context
     """
-    engine = AdaptationEngine(rag_retriever=rag_retriever)
+    engine = AdaptationEngine(
+        rag_retriever=rag_retriever,
+        use_per_shard_rag=use_per_shard_rag,
+    )
     return await engine.adapt(input_json, target_scenario_index)

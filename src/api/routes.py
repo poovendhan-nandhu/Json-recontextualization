@@ -239,6 +239,153 @@ async def clear_rag_collection(collection_name: str):
 
 
 # ============================================================================
+# PER-SHARD-TYPE RAG ENDPOINTS (NEW)
+# ============================================================================
+
+class IndexByShardTypeRequest(BaseModel):
+    """Request for per-shard-type indexing."""
+    simulation_id: str = Field(..., description="Unique simulation identifier")
+    input_json: dict = Field(..., description="The simulation JSON to index")
+    industry: str = Field("unknown", description="Industry of the simulation (for filtering)")
+    clear_existing: bool = Field(False, description="Clear existing index for this simulation")
+
+
+class QuerySimilarExamplesRequest(BaseModel):
+    """Request for similar examples query."""
+    shard_name: str = Field(..., description="Shard type (e.g., 'assessment_criteria', 'workplace_scenario')")
+    query: str = Field(..., description="Search query (target scenario description)")
+    n_results: int = Field(3, description="Number of similar examples to return")
+    industry_filter: Optional[str] = Field(None, description="Filter by industry")
+
+
+@router.post("/rag/index-by-shard-type")
+async def index_simulation_by_shard_type_endpoint(request: IndexByShardTypeRequest):
+    """
+    Index a simulation into per-shard-type collections.
+
+    This enables retrieving similar examples for each shard type during
+    parallel generation (e.g., retrieve similar KLOs when generating KLOs).
+
+    Collections created:
+    - scenarios: Scenario/background content
+    - klos: Key Learning Outcomes and assessment criteria
+    - resources: Resource documents and data
+    - emails: Email templates and content
+    - activities: Simulation flow and activities
+    - rubrics: Rubric criteria and review content
+    """
+    try:
+        from src.rag.retriever import SimulationRetriever
+        from src.stages.sharder import Sharder
+
+        # First shard the simulation
+        sharder = Sharder()
+        collection = sharder.shard(request.input_json)
+
+        # Then index by shard type
+        retriever = SimulationRetriever()
+        result = retriever.index_simulation_by_shard_type(
+            simulation_id=request.simulation_id,
+            shards=collection.shards,
+            industry=request.industry,
+            clear_existing=request.clear_existing,
+        )
+
+        return {
+            "status": "success",
+            "message": f"Indexed simulation into per-shard-type collections",
+            "simulation_id": request.simulation_id,
+            "industry": request.industry,
+            "indexed_by_collection": result.get("indexed_by_collection", {}),
+            "total_shards": result.get("total_shards", 0),
+        }
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+@router.post("/rag/query-similar-examples")
+async def query_similar_examples_endpoint(request: QuerySimilarExamplesRequest):
+    """
+    Query for similar examples of a specific shard type.
+
+    This is the key RAG method for parallel generation - it retrieves
+    similar content from the same shard type across indexed simulations.
+
+    Example: When generating KLOs for a new fashion simulation, retrieve
+    similar KLOs from other indexed simulations for context.
+    """
+    try:
+        from src.rag.retriever import SimulationRetriever
+
+        retriever = SimulationRetriever()
+        examples = retriever.retrieve_similar_examples(
+            shard_name=request.shard_name,
+            query=request.query,
+            n_results=request.n_results,
+            industry_filter=request.industry_filter,
+        )
+
+        return {
+            "status": "success",
+            "shard_type": request.shard_name,
+            "query": request.query[:100] + "..." if len(request.query) > 100 else request.query,
+            "examples": [
+                {
+                    "simulation_id": ex.simulation_id,
+                    "industry": ex.industry,
+                    "score": ex.score,
+                    "content_preview": ex.content[:500] + "..." if len(ex.content) > 500 else ex.content,
+                }
+                for ex in examples
+            ]
+        }
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+@router.get("/rag/shard-type-collections")
+async def list_shard_type_collections():
+    """
+    List all per-shard-type collections with their mappings.
+    """
+    try:
+        from src.rag.vector_store import VectorStore, get_vector_store
+
+        store = get_vector_store()
+
+        # Get counts for shard-type collections
+        shard_type_info = []
+        for name, description in VectorStore.SHARD_TYPE_COLLECTIONS.items():
+            try:
+                count = store.count(name)
+            except Exception:
+                count = 0
+
+            # Find which shards map to this collection
+            mapped_shards = [
+                shard for shard, coll in VectorStore.SHARD_TO_COLLECTION.items()
+                if coll == name
+            ]
+
+            shard_type_info.append({
+                "collection": name,
+                "description": description,
+                "document_count": count,
+                "mapped_shards": mapped_shards,
+            })
+
+        return {
+            "status": "success",
+            "shard_type_collections": shard_type_info,
+        }
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+# ============================================================================
 # ADAPTATION ENGINE - Stage 1: Parallel shard transformation with Gemini
 # ============================================================================
 

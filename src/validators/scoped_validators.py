@@ -38,7 +38,7 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 # GPT model for LLM-based validation
-VALIDATION_MODEL = os.getenv("VALIDATION_MODEL", "gpt-4o-mini")
+VALIDATION_MODEL = os.getenv("VALIDATION_MODEL", "gpt-5.2-2025-12-11")
 
 
 def _get_validation_llm():

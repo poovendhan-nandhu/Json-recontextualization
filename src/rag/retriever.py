@@ -5,16 +5,32 @@ Indexes simulation shards and retrieves context for:
 - Parallel generation (context from related shards)
 - Alignment checking (finding related content)
 - Semantic fixing (industry-appropriate replacements)
+
+KEY FEATURES:
+- Per-shard-type collections (scenarios, klos, resources, emails, activities, rubrics)
+- Similar examples retrieval for each shard type during parallel generation
+- Cross-simulation similarity search
 """
 import json
 import logging
 from typing import Any, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .vector_store import get_vector_store, VectorStore
 from .embeddings import embed_text, embed_texts
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SimilarExample:
+    """A similar example retrieved for RAG-assisted generation."""
+    content: str  # The actual content (JSON string or text)
+    shard_type: str  # Type of shard (e.g., "klos", "scenarios")
+    simulation_id: str  # Source simulation
+    industry: str  # Industry of source (if known)
+    score: float  # Similarity score (lower = more similar)
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -335,6 +351,246 @@ class SimulationRetriever:
 
         return contexts
 
+    # =========================================================================
+    # PER-SHARD-TYPE RAG METHODS (for parallel generation)
+    # =========================================================================
+
+    def index_simulation_by_shard_type(
+        self,
+        simulation_id: str,
+        shards: list,
+        industry: str = "unknown",
+        clear_existing: bool = False,
+    ) -> dict:
+        """
+        Index simulation shards into per-shard-type collections.
+
+        This enables retrieving similar examples for each shard type during
+        parallel generation (e.g., retrieve similar KLOs when generating KLOs).
+
+        Args:
+            simulation_id: Unique simulation identifier
+            shards: List of Shard objects from sharder
+            industry: Industry of the simulation (for filtering)
+            clear_existing: Clear existing docs for this simulation first
+
+        Returns:
+            Indexing summary with counts per collection
+        """
+        indexed_by_collection = {}
+
+        for shard in shards:
+            # Get the appropriate collection for this shard type
+            collection_name = VectorStore.get_collection_for_shard(shard.id)
+
+            # Create document from shard content
+            doc_text = self._shard_to_text(shard)
+            if not doc_text.strip():
+                continue
+
+            # Create rich content with JSON structure preserved
+            content_json = json.dumps(shard.content, indent=2, default=str)
+
+            doc_id = f"{simulation_id}_{shard.id}"
+
+            # Delete existing if requested
+            if clear_existing:
+                try:
+                    self.store.delete(collection_name, [doc_id])
+                except Exception:
+                    pass
+
+            # Add to the shard-type-specific collection
+            try:
+                self.store.add_documents(
+                    collection_name=collection_name,
+                    documents=[content_json],  # Store actual JSON for retrieval
+                    metadatas=[{
+                        "simulation_id": simulation_id,
+                        "shard_id": shard.id,
+                        "shard_name": shard.name,
+                        "industry": industry,
+                        "is_locked": shard.lock_state.value == "FULLY_LOCKED",
+                        "is_blocker": shard.is_blocker,
+                        "searchable_text": doc_text[:5000],  # For context
+                    }],
+                    ids=[doc_id],
+                )
+
+                indexed_by_collection[collection_name] = indexed_by_collection.get(collection_name, 0) + 1
+                logger.debug(f"Indexed shard {shard.id} to collection {collection_name}")
+
+            except Exception as e:
+                logger.warning(f"Failed to index shard {shard.id}: {e}")
+
+        # Also index to legacy 'simulations' collection for backwards compatibility
+        legacy_count = self.index_simulation(simulation_id, shards, clear_existing)
+
+        logger.info(f"Indexed simulation {simulation_id} by shard type: {indexed_by_collection}")
+
+        return {
+            "simulation_id": simulation_id,
+            "industry": industry,
+            "indexed_by_collection": indexed_by_collection,
+            "legacy_indexed": legacy_count.get("indexed", 0),
+            "total_shards": len(shards),
+        }
+
+    def retrieve_similar_examples(
+        self,
+        shard_name: str,
+        query: str,
+        n_results: int = 3,
+        exclude_simulation: str = None,
+        industry_filter: str = None,
+    ) -> list[SimilarExample]:
+        """
+        Retrieve similar examples for a specific shard type.
+
+        This is the key RAG method for parallel generation - it retrieves
+        similar content from the same shard type across indexed simulations.
+
+        Example:
+            When generating KLOs for a new fashion simulation, retrieve
+            similar KLOs from other indexed simulations for context.
+
+        Args:
+            shard_name: Name of the shard (e.g., "assessment_criteria", "workplace_scenario")
+            query: Search query (typically the target scenario description)
+            n_results: Number of similar examples to retrieve
+            exclude_simulation: Simulation ID to exclude from results
+            industry_filter: Optional industry to prioritize (e.g., "retail")
+
+        Returns:
+            List of SimilarExample objects with content and metadata
+        """
+        # Get the appropriate collection for this shard type
+        collection_name = VectorStore.get_collection_for_shard(shard_name)
+
+        # Query the collection
+        try:
+            results = self.store.query(
+                collection_name=collection_name,
+                query_texts=[query],
+                n_results=n_results * 3,  # Get more to filter
+            )
+        except Exception as e:
+            logger.warning(f"Failed to query {collection_name}: {e}")
+            return []
+
+        examples = []
+        if results.get("documents") and results["documents"][0]:
+            for i, doc in enumerate(results["documents"][0]):
+                metadata = results["metadatas"][0][i] if results.get("metadatas") else {}
+                distance = results["distances"][0][i] if results.get("distances") else 0.0
+
+                # Skip excluded simulation
+                sim_id = metadata.get("simulation_id", "")
+                if exclude_simulation and sim_id == exclude_simulation:
+                    continue
+
+                # Prioritize matching industry (but don't exclude others)
+                example_industry = metadata.get("industry", "unknown")
+
+                examples.append(SimilarExample(
+                    content=doc,
+                    shard_type=collection_name,
+                    simulation_id=sim_id,
+                    industry=example_industry,
+                    score=distance,
+                    metadata=metadata,
+                ))
+
+                if len(examples) >= n_results:
+                    break
+
+        # Sort by relevance: matching industry first, then by score
+        if industry_filter:
+            examples.sort(key=lambda x: (
+                0 if x.industry.lower() == industry_filter.lower() else 1,
+                x.score
+            ))
+
+        return examples[:n_results]
+
+    def retrieve_all_shard_examples(
+        self,
+        target_scenario: str,
+        shard_names: list[str],
+        n_results_per_shard: int = 2,
+        exclude_simulation: str = None,
+        industry: str = None,
+    ) -> dict[str, list[SimilarExample]]:
+        """
+        Retrieve similar examples for multiple shard types at once.
+
+        Used during parallel generation to get context for all shards.
+
+        Args:
+            target_scenario: The target scenario description
+            shard_names: List of shard names to retrieve examples for
+            n_results_per_shard: Number of examples per shard type
+            exclude_simulation: Simulation to exclude
+            industry: Industry to prioritize
+
+        Returns:
+            Dict mapping shard names to their similar examples
+        """
+        all_examples = {}
+
+        for shard_name in shard_names:
+            examples = self.retrieve_similar_examples(
+                shard_name=shard_name,
+                query=target_scenario,
+                n_results=n_results_per_shard,
+                exclude_simulation=exclude_simulation,
+                industry_filter=industry,
+            )
+            all_examples[shard_name] = examples
+
+        logger.info(f"Retrieved examples for {len(shard_names)} shard types")
+        return all_examples
+
+    def format_examples_for_prompt(
+        self,
+        examples: list[SimilarExample],
+        max_chars: int = 5000,
+    ) -> str:
+        """
+        Format similar examples for inclusion in LLM prompt.
+
+        Args:
+            examples: List of SimilarExample objects
+            max_chars: Maximum characters to include
+
+        Returns:
+            Formatted string for prompt injection
+        """
+        if not examples:
+            return ""
+
+        parts = ["SIMILAR EXAMPLES FROM OTHER SIMULATIONS:\n"]
+        total_chars = len(parts[0])
+
+        for i, ex in enumerate(examples, 1):
+            header = f"\n--- Example {i} (Industry: {ex.industry}, Score: {ex.score:.3f}) ---\n"
+
+            # Truncate content if needed
+            content = ex.content
+            remaining = max_chars - total_chars - len(header) - 100
+            if len(content) > remaining:
+                content = content[:remaining] + "\n... [truncated]"
+
+            example_text = header + content
+            total_chars += len(example_text)
+
+            if total_chars > max_chars:
+                break
+
+            parts.append(example_text)
+
+        return "".join(parts)
+
 
 # Convenience functions
 def index_simulation(simulation_id: str, shards: list, clear_existing: bool = False) -> dict:
@@ -353,3 +609,43 @@ def retrieve_similar_chunks(text: str, n_results: int = 5) -> list[RetrievedCont
     """Find similar chunks. See SimulationRetriever.find_similar_chunks."""
     retriever = SimulationRetriever()
     return retriever.find_similar_chunks(text, n_results)
+
+
+# New per-shard-type convenience functions
+def index_simulation_by_shard_type(
+    simulation_id: str,
+    shards: list,
+    industry: str = "unknown",
+    clear_existing: bool = False,
+) -> dict:
+    """Index simulation by shard type. See SimulationRetriever.index_simulation_by_shard_type."""
+    retriever = SimulationRetriever()
+    return retriever.index_simulation_by_shard_type(simulation_id, shards, industry, clear_existing)
+
+
+def retrieve_similar_examples(
+    shard_name: str,
+    query: str,
+    n_results: int = 3,
+    exclude_simulation: str = None,
+    industry_filter: str = None,
+) -> list[SimilarExample]:
+    """Retrieve similar examples for a shard type. See SimulationRetriever.retrieve_similar_examples."""
+    retriever = SimulationRetriever()
+    return retriever.retrieve_similar_examples(
+        shard_name, query, n_results, exclude_simulation, industry_filter
+    )
+
+
+def retrieve_all_shard_examples(
+    target_scenario: str,
+    shard_names: list[str],
+    n_results_per_shard: int = 2,
+    exclude_simulation: str = None,
+    industry: str = None,
+) -> dict[str, list[SimilarExample]]:
+    """Retrieve examples for multiple shard types. See SimulationRetriever.retrieve_all_shard_examples."""
+    retriever = SimulationRetriever()
+    return retriever.retrieve_all_shard_examples(
+        target_scenario, shard_names, n_results_per_shard, exclude_simulation, industry
+    )

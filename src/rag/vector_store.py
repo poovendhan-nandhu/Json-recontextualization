@@ -36,14 +36,60 @@ class VectorStore:
     ChromaDB-based vector store for simulation context.
 
     Collections:
-    - simulations: Indexed simulation shards for retrieval
-    - industry_knowledge: Industry-specific KPIs, terminology
+    - Per-shard-type collections for RAG-assisted generation:
+      - scenarios: Scenario/background content
+      - klos: Key Learning Outcomes and assessment criteria
+      - resources: Resource documents and data
+      - emails: Email templates and content
+      - activities: Activities and simulation flow
+      - rubrics: Rubric criteria and review content
+    - Generic collections:
+      - simulations: All indexed simulation shards (legacy)
+      - industry_knowledge: Industry-specific KPIs and terminology
+      - entity_mappings: Entity name mappings for recontextualization
     """
 
-    COLLECTIONS = {
-        "simulations": "Indexed simulation shards for context retrieval",
+    # Per-shard-type collections (for similar examples retrieval)
+    SHARD_TYPE_COLLECTIONS = {
+        "scenarios": "Scenario backgrounds, workplace context, selected scenarios",
+        "klos": "Key Learning Outcomes, assessment criteria, learning objectives",
+        "resources": "Resource documents, data tables, attachments",
+        "emails": "Email templates, intro emails, task emails",
+        "activities": "Simulation flow, stages, activities",
+        "rubrics": "Rubric criteria, review guidelines, grading",
+    }
+
+    # Generic collections
+    GENERIC_COLLECTIONS = {
+        "simulations": "All indexed simulation shards (legacy/fallback)",
         "industry_knowledge": "Industry-specific KPIs and terminology",
         "entity_mappings": "Entity name mappings for recontextualization",
+    }
+
+    # Combined for backwards compatibility
+    COLLECTIONS = {**SHARD_TYPE_COLLECTIONS, **GENERIC_COLLECTIONS}
+
+    # Map shard names to collection types
+    SHARD_TO_COLLECTION = {
+        # Scenario-related shards
+        "selected_scenario": "scenarios",
+        "workplace_scenario": "scenarios",
+        "scenario_chat_history": "scenarios",
+        # KLO-related shards
+        "assessment_criteria": "klos",
+        "lesson_information": "klos",
+        # Resource shards
+        "resources": "resources",
+        # Email shards
+        "emails": "emails",
+        # Activity/flow shards
+        "simulation_flow": "activities",
+        "industry_activities": "activities",
+        # Rubric shards
+        "rubrics": "rubrics",
+        # Settings (goes to scenarios as context)
+        "launch_settings": "scenarios",
+        "videos": "activities",
     }
 
     def __init__(self, persist_dir: str = "./chroma_db"):
@@ -93,6 +139,24 @@ class VectorStore:
             logger.debug(f"Collection '{name}' ready")
 
         return self._collections[name]
+
+    @classmethod
+    def get_collection_for_shard(cls, shard_name: str) -> str:
+        """
+        Get the appropriate collection name for a shard type.
+
+        Args:
+            shard_name: Name of the shard (e.g., "workplace_scenario", "assessment_criteria")
+
+        Returns:
+            Collection name (e.g., "scenarios", "klos")
+        """
+        return cls.SHARD_TO_COLLECTION.get(shard_name, "simulations")
+
+    @classmethod
+    def get_shard_type_collections(cls) -> list[str]:
+        """Get list of per-shard-type collection names."""
+        return list(cls.SHARD_TYPE_COLLECTIONS.keys())
 
     def add_documents(
         self,
