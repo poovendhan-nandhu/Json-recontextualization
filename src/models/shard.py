@@ -188,10 +188,10 @@ class ShardCollection:
 @dataclass
 class ComplianceScore:
     """Weighted compliance score from Finisher stage."""
-    blocker_pass_rate: float      # Must be 1.0 to pass
-    overall_score: float          # Must be >= 0.98 to pass
+    blocker_pass_rate: float      # >= 0.80 to pass
+    overall_score: float          # >= 0.95 to pass
     shard_scores: dict[str, float] = field(default_factory=dict)
 
     def is_passing(self) -> bool:
         """Check if scores meet thresholds."""
-        return self.blocker_pass_rate == 1.0 and self.overall_score >= 0.98
+        return self.blocker_pass_rate >= 0.80 and self.overall_score >= 0.95

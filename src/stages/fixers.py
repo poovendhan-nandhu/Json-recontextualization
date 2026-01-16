@@ -25,11 +25,25 @@ from typing import Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
+import httpx
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel, Field
 from langsmith import traceable
+
+# Global semaphore for controlling concurrent LLM calls
+# This is the KEY to true parallelism - limits concurrent requests to avoid serialization
+MAX_CONCURRENT_LLM_CALLS = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "10"))
+_llm_semaphore = None  # Will be initialized lazily in async context
+
+
+def _get_semaphore():
+    """Get or create the semaphore (must be called in async context)."""
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+    return _llm_semaphore
 
 from ..utils.patcher import (
     JSONPatcher,
@@ -46,14 +60,42 @@ FIXER_MODEL = os.getenv("FIXER_MODEL", "gpt-5.2-2025-12-11")
 
 
 def _get_fixer_llm():
-    """Get OpenAI client for fixing."""
+    """
+    Get OpenAI client for fixing.
+
+    CRITICAL: Each call creates a NEW httpx.AsyncClient to enable TRUE parallel execution.
+    Without this, all LLM calls share the same connection and run sequentially.
+    """
+    # Create NEW http client for each LLM instance - enables true parallelism
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(300.0, connect=30.0),  # 5 min read, 30s connect
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),  # Higher limits for parallelism
+    )
+
     return ChatOpenAI(
         model=FIXER_MODEL,
         temperature=0.1,  # Low temp for precise field identification
         max_retries=3,
         request_timeout=300,  # 5 minutes for complex KLO alignment
+        http_async_client=http_client,  # CRITICAL: Use separate HTTP client
         api_key=os.getenv("OPENAI_API_KEY"),
     )
+
+
+async def _invoke_with_semaphore(llm, prompt: str) -> str:
+    """
+    Invoke LLM with semaphore for controlled parallelism.
+
+    This is the KEY to true parallel execution:
+    1. Semaphore limits concurrent requests (prevents serialization)
+    2. Each call gets its own HTTP client (via _get_llm())
+    3. asyncio.gather then runs them truly in parallel
+    """
+    semaphore = _get_semaphore()
+    async with semaphore:
+        logger.debug(f"[PARALLEL] Acquired semaphore, invoking LLM...")
+        result = await llm.ainvoke(prompt)
+        return result.content if hasattr(result, 'content') else str(result)
 
 
 # =============================================================================
@@ -151,8 +193,12 @@ class StructuralFixer:
     """
 
     def __init__(self):
-        self.llm = _get_fixer_llm()
+        # Don't create shared LLM - get fresh instance for each call
         self.patcher = get_patcher()
+
+    def _get_llm(self):
+        """Get fresh LLM instance for parallel execution."""
+        return _get_fixer_llm()
 
     @traceable(name="structural_fixer_identify")
     async def identify_fixes(
@@ -166,11 +212,17 @@ class StructuralFixer:
 
         Returns list of FieldFix with JSON Pointer paths.
         """
-        # Build issue list for prompt
-        issue_text = "\n".join([
-            f"- {i.message} at {getattr(i, 'location', 'unknown')}"
-            for i in issues
-        ])
+        # Build issue list for prompt - handle both dict and object formats
+        def get_issue_info(issue):
+            if isinstance(issue, dict):
+                msg = issue.get('message', issue.get('description', str(issue)))
+                loc = issue.get('location', 'unknown')
+            else:
+                msg = getattr(issue, 'message', str(issue))
+                loc = getattr(issue, 'location', 'unknown')
+            return f"- {msg} at {loc}"
+
+        issue_text = "\n".join([get_issue_info(i) for i in issues])
 
         prompt = f"""Identify the EXACT fields that need STRUCTURAL fixes in this JSON.
 
@@ -215,14 +267,21 @@ Only suggest structural changes (shape, types), never content changes.
                 ("human", "{input}"),
             ])
 
-            chain = chat_prompt | self.llm | parser
+            chain = chat_prompt | self._get_llm() | parser
 
-            result = await chain.ainvoke({
-                "input": prompt,
-                "format_instructions": parser.get_format_instructions(),
-            })
-
-            return result.fixes
+            # Use semaphore for controlled parallelism
+            semaphore = _get_semaphore()
+            async with semaphore:
+                try:
+                    result = await chain.ainvoke({
+                        "input": prompt,
+                        "format_instructions": parser.get_format_instructions(),
+                    })
+                    return result.fixes
+                except Exception as parse_error:
+                    # LLM returned malformed JSON - skip this fixer
+                    logger.warning(f"[STRUCTURAL FIXER]: LLM returned invalid format, skipping: {str(parse_error)[:200]}")
+                    return []
 
         except Exception as e:
             logger.error(f"Failed to identify structural fixes: {e}")
@@ -286,6 +345,11 @@ Only suggest structural changes (shape, types), never content changes.
         for fix in field_fixes:
             if fix.fix_type != "structural":
                 continue  # Skip non-structural fixes
+
+            # Skip invalid paths (empty, root, or None)
+            if not fix.path or fix.path == "/" or fix.path.strip() == "":
+                logger.debug(f"Skipping invalid path for structural fix: '{fix.path}'")
+                continue
 
             # Get current value for rollback
             try:
@@ -355,8 +419,12 @@ class SemanticFixer:
     """
 
     def __init__(self):
-        self.llm = _get_fixer_llm()
+        # Don't create shared LLM - get fresh instance for each call
         self.patcher = get_patcher()
+
+    def _get_llm(self):
+        """Get fresh LLM instance for parallel execution."""
+        return _get_fixer_llm()
 
     @traceable(name="semantic_fixer_identify")
     async def identify_fixes(
@@ -367,83 +435,125 @@ class SemanticFixer:
     ) -> tuple[list[FieldFix], dict]:
         """
         Use LLM to identify exact fields that need semantic fixes.
+        Uses SPECIALIZED PROMPTS based on shard type for better fixes.
 
         Returns (list of FieldFix, entity_replacements dict)
         """
+        from .fixer_prompts import get_prompt_for_shard, get_prompt_type_for_shard
+
         # Get context for fixes
         factsheet = context.get("global_factsheet", {})
         industry = context.get("industry", "unknown")
         poison_list = factsheet.get("poison_list", [])
         replacement_hints = factsheet.get("replacement_hints", {})
+        shard_id = context.get("shard_id", "unknown")
 
-        # Build issue list
+        # Get company info
+        company_info = factsheet.get("company", {})
+        company_name = company_info.get("name", "Unknown Company")
+
+        # Get KLOs for alignment prompts
+        klos = factsheet.get("klos", [])
+        if not klos:
+            # Try to extract from learner objectives
+            klos = factsheet.get("learning_objectives", [])
+
+        # Get learner role info
+        learner_role = factsheet.get("learner_role", {})
+        role_name = learner_role.get("role", "Analyst")
+        challenge = factsheet.get("context", {}).get("challenge", "")
+
+        # Build issue list - handle both dict and object formats
+        def get_issue_message(issue):
+            if isinstance(issue, dict):
+                return issue.get('message', issue.get('description', str(issue)))
+            return getattr(issue, 'message', str(issue))
+
         issue_text = "\n".join([
-            f"- {i.message}"
+            f"- {get_issue_message(i)}"
             for i in issues
         ])
 
-        # Build replacement guide
-        replacement_text = ""
-        if poison_list:
-            replacement_text += f"\n## POISON LIST (must replace these terms):\n{json.dumps(poison_list)}"
-        if replacement_hints:
-            replacement_text += f"\n## REPLACEMENT HINTS:\n{json.dumps(replacement_hints)}"
+        # Add alignment issues from context
+        alignment_feedback = context.get("alignment_feedback", {})
+        alignment_issues = alignment_feedback.get("critical_issues", [])
+        if alignment_issues:
+            issue_text += "\n" + "\n".join([f"- {issue}" for issue in alignment_issues[:5]])
 
-        prompt = f"""Identify the EXACT fields that need SEMANTIC fixes in this JSON.
+        # ⭐ Get SPECIALIZED PROMPT based on shard type
+        prompt_type = get_prompt_type_for_shard(shard_id)
+        prompt_template = get_prompt_for_shard(shard_id)
 
-## RULES:
-1. Return JSON Pointer paths (RFC 6901) for each field to fix
-2. Only semantic issues (wrong terms, old entity names, invalid KPIs)
-3. DO NOT change structure (keys, types, arrays)
-4. Replace old entity names with new ones
-5. Replace invalid KPIs with industry-appropriate ones
+        print(f"[SEMANTIC FIXER] Shard {shard_id} → using {prompt_type} prompt")
 
-## TARGET INDUSTRY: {industry}
-
-## SEMANTIC ISSUES FOUND:
-{issue_text}
-{replacement_text}
-
-## CURRENT JSON:
-```json
-{json.dumps(content, indent=2)[:6000]}
-```
-
-## OUTPUT:
-For each field that needs fixing, provide:
-- path: JSON Pointer path (e.g., "/topicWizardData/simulationFlow/0/data/introEmail/body")
-- current_value: What's there now
-- new_value: What it should be (with replacements applied)
-- reason: Why this fix is needed
-- fix_type: "semantic"
-
-Also provide a 'replacements' dict mapping old terms to new terms.
-Only return fields that ACTUALLY contain terms that need replacing."""
+        # Format the specialized prompt
+        prompt = prompt_template.format(
+            industry=industry,
+            company_name=company_name,
+            content=json.dumps(content, indent=2)[:6000],
+            issues=issue_text,
+            poison_list=json.dumps(poison_list) if poison_list else "[]",
+            replacements=json.dumps(replacement_hints) if replacement_hints else "{}",
+            klos=json.dumps(klos[:5]) if klos else "[]",
+            learner_role=role_name,
+            challenge=challenge,
+            entity_map=json.dumps(replacement_hints) if replacement_hints else "{}",
+        )
 
         try:
             parser = PydanticOutputParser(pydantic_object=SemanticFixResponse)
 
             chat_prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are a semantic content analyzer.
-Identify exact fields that need term/entity replacements using JSON Pointer paths.
-Focus on entity names, KPIs, and industry terminology.
-Never suggest structural changes.
+                ("system", """You are a specialized content fixer.
+Return fixes as JSON with 'fixes' array and 'replacements' dict.
+
+Each fix needs:
+- path: JSON Pointer to the SPECIFIC field (e.g., "/topicWizardData/lessonInformation/title" - NEVER use "/" or empty path)
+- current_value: The current value at that path
+- new_value: The fixed value
+- reason: Why this fix is needed
+- fix_type: "semantic"
+
+IMPORTANT: The path MUST point to a specific field, not the root. Example paths:
+- /topicWizardData/simulationName
+- /topicWizardData/workplaceScenario/background/organizationName
+- /topicWizardData/simulationFlow/0/children/0/data/email/body
 
 {format_instructions}"""),
                 ("human", "{input}"),
             ])
 
-            chain = chat_prompt | self.llm | parser
+            chain = chat_prompt | self._get_llm() | parser
 
-            result = await chain.ainvoke({
-                "input": prompt,
-                "format_instructions": parser.get_format_instructions(),
-            })
+            # Use semaphore for controlled parallelism
+            semaphore = _get_semaphore()
+            async with semaphore:
+                try:
+                    result = await chain.ainvoke({
+                        "input": prompt,
+                        "format_instructions": parser.get_format_instructions(),
+                    })
 
-            return result.fixes, result.replacements
+                    # Filter out invalid fixes (empty paths, root paths)
+                    valid_fixes = [
+                        fix for fix in result.fixes
+                        if fix.path and fix.path != "/" and fix.path.strip() != ""
+                    ]
+                    invalid_count = len(result.fixes) - len(valid_fixes)
+
+                    if invalid_count > 0:
+                        logger.debug(f"[SEMANTIC FIXER] {shard_id}: Filtered out {invalid_count} invalid fixes (empty/root paths)")
+
+                    print(f"[SEMANTIC FIXER] {shard_id}: Found {len(valid_fixes)} valid fixes" +
+                          (f" (filtered {invalid_count} invalid)" if invalid_count > 0 else ""))
+                    return valid_fixes, result.replacements
+                except Exception as parse_error:
+                    # LLM returned malformed JSON - skip this fixer
+                    logger.warning(f"[SEMANTIC FIXER] {shard_id}: LLM returned invalid format, skipping: {str(parse_error)[:200]}")
+                    return [], {}
 
         except Exception as e:
-            logger.error(f"Failed to identify semantic fixes: {e}")
+            logger.error(f"Failed to identify semantic fixes for {shard_id}: {e}")
             return [], {}
 
     @traceable(name="semantic_fixer_apply")
@@ -465,14 +575,35 @@ Never suggest structural changes.
         content = copy.deepcopy(content)  # Don't modify original
 
         # Filter to semantic issues only
+        # Handle both dict and object formats
+        def get_issue_rule_id(issue):
+            if isinstance(issue, dict):
+                return issue.get('rule_id', '')
+            return getattr(issue, 'rule_id', '')
+
+        SEMANTIC_RULE_IDS = {
+            'entity_removal', 'entityremoval',
+            'domain_fidelity', 'domainfidelity',
+            'tone', 'tonevalidator',
+            # Batched check rule_ids
+            'context_fidelity',
+            'resource_self_contained',
+            'data_consistency',
+            'realism',
+            'inference_integrity',
+            # ContentCompleteness issues
+            'contentcompleteness',
+        }
+
         semantic_issues = [
             i for i in issues
-            if getattr(i, 'rule_id', '') in (
-                'entity_removal', 'entityremoval',
-                'domain_fidelity', 'domainfidelity',
-                'tone', 'tonevalidator'
-            )
+            if get_issue_rule_id(i) in SEMANTIC_RULE_IDS or get_issue_rule_id(i) not in {
+                'structure_integrity', 'structureintegrity',
+                'id_preservation', 'idpreservation',
+            }
         ]
+
+        print(f"[SEMANTIC FIXER] {shard_id}: {len(issues)} total issues, {len(semantic_issues)} semantic issues")
 
         if not semantic_issues:
             return FixResult(
@@ -483,8 +614,11 @@ Never suggest structural changes.
                 changes_made=["No semantic issues to fix"]
             )
 
-        # Step 1: LLM identifies exact fields to fix
-        field_fixes, replacements = await self.identify_fixes(content, semantic_issues, context)
+        # Add shard_id to context for specialized prompt selection
+        fix_context = {**context, "shard_id": shard_id}
+
+        # Step 1: LLM identifies exact fields to fix (uses specialized prompt)
+        field_fixes, replacements = await self.identify_fixes(content, semantic_issues, fix_context)
 
         if not field_fixes:
             return FixResult(
@@ -501,11 +635,17 @@ Never suggest structural changes.
             if fix.fix_type != "semantic":
                 continue  # Skip non-semantic fixes
 
+            # Skip invalid paths (empty, root, or None)
+            if not fix.path or fix.path == "/" or fix.path.strip() == "":
+                logger.debug(f"Skipping invalid path for semantic fix: '{fix.path}'")
+                continue
+
             # Get current value for rollback
             try:
                 old_value = self.patcher.get_value(content, fix.path)
-            except KeyError:
-                logger.warning(f"Path not found for semantic fix: {fix.path}")
+            except (KeyError, IndexError, TypeError):
+                # Expected - LLM sometimes generates invalid paths, skip silently
+                logger.debug(f"Path not found for semantic fix: {fix.path}")
                 continue
 
             # Only create patch if value actually changed
@@ -532,6 +672,13 @@ Never suggest structural changes.
 
         # Step 3: Apply patches via Patcher
         patch_result = self.patcher.apply_patches(content, patches)
+
+        # Log actual results
+        applied_count = len(patch_result.applied_patches)
+        failed_count = len(patch_result.failed_patches)
+        if applied_count > 0 or failed_count > 0:
+            print(f"[SEMANTIC FIXER] {shard_id}: Applied {applied_count}/{len(patches)} patches" +
+                  (f" ({failed_count} failed)" if failed_count > 0 else ""))
 
         changes_made = [
             f"{p.path}: {p.reason}"
@@ -627,10 +774,16 @@ class ScopedFixer:
             )
 
         # Collect all issues
+        # Handle both dict and object formats
         all_issues = []
         for result in validation_results:
-            if hasattr(result, 'issues'):
-                all_issues.extend(result.issues)
+            if isinstance(result, dict):
+                issues = result.get('issues', [])
+            else:
+                issues = getattr(result, 'issues', [])
+            all_issues.extend(issues)
+
+        print(f"[FIXER DEBUG] Collected {len(all_issues)} issues for shard {shard_id}")
 
         if not all_issues:
             return FixResult(
@@ -642,22 +795,40 @@ class ScopedFixer:
             )
 
         # Determine fix type needed
-        has_structural = any(
-            getattr(i, 'rule_id', '') in (
-                'structure_integrity', 'structureintegrity',
-                'id_preservation', 'idpreservation',
-                'content_completeness', 'contentcompleteness'
-            )
-            for i in all_issues
-        )
-        has_semantic = any(
-            getattr(i, 'rule_id', '') in (
-                'entity_removal', 'entityremoval',
-                'domain_fidelity', 'domainfidelity',
-                'tone', 'tonevalidator'
-            )
-            for i in all_issues
-        )
+        # Handle both dict and object formats for issues
+        def get_rule_id(issue):
+            if isinstance(issue, dict):
+                return issue.get('rule_id', '')
+            return getattr(issue, 'rule_id', '')
+
+        # Structural issues: structure, IDs, content completeness
+        STRUCTURAL_RULES = {
+            'structure_integrity', 'structureintegrity',
+            'id_preservation', 'idpreservation',
+            'content_completeness', 'contentcompleteness'
+        }
+
+        # Semantic issues: ALL other issues that need LLM-based fixes
+        SEMANTIC_RULES = {
+            'entity_removal', 'entityremoval',
+            'domain_fidelity', 'domainfidelity',
+            'tone', 'tonevalidator',
+            # Add batched check rule_ids
+            'context_fidelity',
+            'resource_self_contained',
+            'data_consistency',
+            'realism',
+            'inference_integrity',
+        }
+
+        rule_ids_found = set(get_rule_id(i) for i in all_issues)
+        print(f"[FIXER DEBUG] Shard {shard_id}: rule_ids found = {rule_ids_found}")
+
+        has_structural = bool(rule_ids_found & STRUCTURAL_RULES)
+        # Semantic = any semantic rules OR any unknown rules (catch-all)
+        has_semantic = bool(rule_ids_found & SEMANTIC_RULES) or bool(rule_ids_found - STRUCTURAL_RULES)
+
+        print(f"[FIXER DEBUG] Shard {shard_id}: has_structural={has_structural}, has_semantic={has_semantic}")
 
         status.fix_attempts += 1
         final_result = None
@@ -718,7 +889,20 @@ class ScopedFixer:
         """
         results = {}
 
-        for shard in shards:
+        # Debug: Print what we received
+        print(f"[FIXER DEBUG] Number of shards: {len(shards)}")
+        print(f"[FIXER DEBUG] validation_report has shard_results: {hasattr(validation_report, 'shard_results')}")
+        if hasattr(validation_report, 'shard_results'):
+            print(f"[FIXER DEBUG] shard_results keys: {list(validation_report.shard_results.keys())}")
+
+        # Helper to check issue counts
+        def get_count(r, key):
+            if isinstance(r, dict):
+                return r.get(key, 0)
+            return getattr(r, key, 0)
+
+        # Prepare tasks for parallel execution
+        async def fix_one_shard(shard):
             shard_id = shard.id if hasattr(shard, 'id') else "unknown"
 
             # Get validation results for this shard
@@ -726,26 +910,40 @@ class ScopedFixer:
             if hasattr(validation_report, 'shard_results'):
                 shard_results = validation_report.shard_results.get(shard_id, [])
 
-            # Check if any issues need fixing
             has_issues = any(
-                getattr(r, 'blocker_count', 0) > 0 or getattr(r, 'warning_count', 0) > 0
+                get_count(r, 'blocker_count') > 0 or get_count(r, 'warning_count') > 0
                 for r in shard_results
             )
 
             if not has_issues:
-                results[shard_id] = FixResult(
+                return shard_id, FixResult(
                     shard_id=shard_id,
                     fix_type=FixType.NONE,
                     success=True,
                     fixed_content=shard.content if hasattr(shard, 'content') else shard,
                     changes_made=["No issues to fix"]
                 )
-                continue
 
-            # Fix the shard
+            print(f"[FIXER] Shard {shard_id} has issues - fixing in parallel")
             result = await self.fix_shard(shard, shard_results, context)
-            results[shard_id] = result
+            return shard_id, result
 
+        # Run ALL shards in parallel using create_task for TRUE parallelism
+        print(f"[FIXER] Running {len(shards)} shards in PARALLEL (semaphore limit: {MAX_CONCURRENT_LLM_CALLS})")
+        coroutines = [fix_one_shard(shard) for shard in shards]
+        # Create actual Task objects to force concurrent scheduling
+        tasks = [asyncio.create_task(coro) for coro in coroutines]
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for result in task_results:
+            if isinstance(result, Exception):
+                logger.error(f"Fixer failed: {result}")
+                continue
+            shard_id, fix_result = result
+            results[shard_id] = fix_result
+
+        print(f"[FIXER] Completed {len(results)} shards in parallel")
         return results
 
     def rollback_shard(self, shard: Any, shard_id: str = None) -> Optional[dict]:
@@ -849,14 +1047,22 @@ class BatchedSemanticFixer:
         patches = []
         for fix in fixes:
             try:
+                path = fix.get("path", "")
+
+                # Skip invalid paths (empty, root, or None)
+                if not path or path == "/" or path.strip() == "":
+                    logger.debug(f"Skipping invalid path for batched fix: '{path}'")
+                    continue
+
                 # Validate path exists
-                if not self.patcher.path_exists(content, fix["path"]):
-                    logger.warning(f"Path not found for fix: {fix['path']}")
+                if not self.patcher.path_exists(content, path):
+                    # Expected - LLM sometimes generates invalid paths
+                    logger.debug(f"Path not found for fix: {path}")
                     continue
 
                 patch = PatchOp(
                     op="replace",
-                    path=fix["path"],
+                    path=path,
                     value=fix["new_value"],
                     old_value=fix.get("old_value"),
                     reason=fix.get("reason", "Batched semantic fix"),
@@ -916,7 +1122,9 @@ class BatchedSemanticFixer:
             fixes = all_fixes.get(shard_id, [])
             return shard_id, await self.apply_fixes(shard, fixes, context)
 
-        tasks = [fix_one(shard) for shard in shards]
+        # Create actual Task objects for TRUE parallelism
+        coroutines = [fix_one(shard) for shard in shards]
+        tasks = [asyncio.create_task(coro) for coro in coroutines]
         fix_results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for result in fix_results:
@@ -1004,7 +1212,12 @@ class KLOAlignmentFixer:
     """
 
     def __init__(self):
-        self.llm = _get_fixer_llm()
+        # Don't create shared LLM - get fresh instance for each call
+        pass
+
+    def _get_llm(self):
+        """Get fresh LLM instance for parallel execution."""
+        return _get_fixer_llm()
 
     def _extract_klos(self, topic_data: dict) -> list[dict]:
         """Extract KLOs from adapted JSON."""
@@ -1111,59 +1324,129 @@ class KLOAlignmentFixer:
 
         return activities
 
-    async def _check_single_klo(
+    async def _check_and_fix_klo(
         self,
         klo: dict,
         questions: list,
-        activities: list,
         company_name: str,
         industry: str,
     ) -> dict:
-        """Check alignment for a single KLO (runs in parallel)."""
+        """
+        Check alignment for a single KLO and generate fix if needed.
+        Runs in parallel with other KLO checks.
+
+        Returns:
+            {
+                "klo_id": str,
+                "is_aligned": bool,
+                "matched_question_id": str or None,
+                "fix": None or {
+                    "question_id": str,
+                    "original_text": str,
+                    "new_text": str
+                }
+            }
+        """
         klo_id = klo.get("id", "unknown")
         klo_text = klo.get("klo", "")
 
-        prompt = f"""Check if this KLO is properly assessed by the questions/activities.
+        # Format questions for prompt (only id and text)
+        # Questions come wrapped: {"location": ..., "question": {...actual question...}}
+        questions_simplified = []
+        for i, q in enumerate(questions[:15]):
+            # Unwrap if wrapped
+            actual_q = q.get("question", q) if isinstance(q, dict) else q
+            if isinstance(actual_q, dict):
+                q_id = actual_q.get("id", f"q_{i}")
+                q_text = actual_q.get("question", actual_q.get("text", ""))
+                if q_text:
+                    questions_simplified.append({"id": q_id, "question": q_text})
 
-## KLO TO CHECK:
-ID: {klo_id}
-Text: {klo_text}
-Criteria: {json.dumps(klo.get('criteria', []))}
+        prompt = f"""You are a KLO Alignment Expert for business simulations.
 
-## AVAILABLE QUESTIONS (check if any assess this KLO):
-{json.dumps(questions[:10], indent=2)}
+## STEP 1: ANALYZE THIS KLO
+KLO: "{klo_text}"
 
-## AVAILABLE ACTIVITIES (check if any assess this KLO):
-{json.dumps(activities[:8], indent=2)}
+Extract the KEY TERMS that MUST appear in an aligned question:
+- What is the ACTION VERB? (e.g., analyze, develop, create, evaluate, identify)
+- What is the MAIN CONCEPT? (e.g., market strategy, customer segments, pricing model)
+- What is the CONTEXT/METHOD? (e.g., using data, for target market, with criteria)
 
-## CONTEXT:
-Company: {company_name}, Industry: {industry}
+## STEP 2: CHECK THESE QUESTIONS
+{json.dumps(questions_simplified, indent=2)}
 
-## TASK:
-1. Does at least one question/activity properly assess this KLO?
-2. If NO, suggest a better question that would assess it.
+A question is ALIGNED if it contains the KEY TERMS from the KLO above.
+- ALIGNED: Uses the SAME action verb + SAME main concept + SAME context
+- NOT ALIGNED: Uses synonyms, is vague, or misses key terms
 
-## OUTPUT (JSON):
+## STEP 3: IF NOT ALIGNED, REWRITE
+Pick the closest question and rewrite it to include:
+1. The EXACT key terms from THIS KLO (not generic terms)
+2. Reference to {company_name} ({industry})
+3. A measurable outcome
+
+## CONTEXT
+- Company: {company_name}
+- Industry: {industry}
+- This is an undergraduate business simulation
+
+## OUTPUT (JSON only, no other text):
 {{
-  "klo_id": "{klo_id}",
+  "key_terms_from_klo": ["list", "of", "key", "terms", "extracted"],
   "is_aligned": true/false,
-  "matching_items": ["list of question/activity names that assess this KLO"],
-  "suggested_fix": null or {{"type": "question", "text": "suggested question text"}}
+  "matched_question_id": "id" or null,
+  "fix": null or {{
+    "question_id": "id of question to rewrite",
+    "original_text": "the original question",
+    "new_text": "rewritten question using the key_terms_from_klo"
+  }}
 }}"""
 
         try:
-            result = await self.llm.ainvoke(prompt)
-            content = result.content if hasattr(result, 'content') else str(result)
+            # Use semaphore for controlled parallelism
+            content = await _invoke_with_semaphore(self._get_llm(), prompt)
 
-            # Parse JSON from response
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if json_match:
-                return json.loads(json_match.group())
-            return {"klo_id": klo_id, "is_aligned": True, "matching_items": [], "suggested_fix": None}
+            # Extract JSON by finding balanced braces (handles nested objects)
+            def extract_json_object(text):
+                start = text.find('{')
+                if start == -1:
+                    return None
+                depth = 0
+                for i, char in enumerate(text[start:], start):
+                    if char == '{':
+                        depth += 1
+                    elif char == '}':
+                        depth -= 1
+                        if depth == 0:
+                            return text[start:i+1]
+                return None
+
+            json_str = extract_json_object(content)
+
+            if json_str:
+                try:
+                    parsed = json.loads(json_str)
+                    parsed["klo_id"] = klo_id
+                    return parsed
+                except json.JSONDecodeError:
+                    # Try to repair common JSON issues
+                    import re
+                    # Remove trailing commas before }
+                    json_str = re.sub(r',\s*}', '}', json_str)
+                    json_str = re.sub(r',\s*]', ']', json_str)
+                    parsed = json.loads(json_str)
+                    parsed["klo_id"] = klo_id
+                    return parsed
+
+            logger.warning(f"Could not find JSON for KLO {klo_id}")
+            return {"klo_id": klo_id, "is_aligned": True, "matched_question_id": None, "fix": None}
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"JSON parse error for KLO {klo_id}: {e}")
+            return {"klo_id": klo_id, "is_aligned": True, "matched_question_id": None, "fix": None}
         except Exception as e:
             logger.warning(f"KLO check failed for {klo_id}: {e}")
-            return {"klo_id": klo_id, "is_aligned": True, "matching_items": [], "suggested_fix": None}
+            return {"klo_id": klo_id, "is_aligned": True, "matched_question_id": None, "fix": None}
 
     @traceable(name="klo_alignment_fixer")
     async def fix(self, adapted_json: dict, context: dict) -> dict:
@@ -1171,6 +1454,7 @@ Company: {company_name}, Industry: {industry}
         Fix KLO alignment in adapted JSON using BATCH + PARALLEL approach.
 
         Each KLO is checked separately in parallel for speed.
+        If a KLO is misaligned, the question is rewritten to match KLO terminology.
 
         Args:
             adapted_json: The adapted JSON after adaptation stage
@@ -1184,30 +1468,36 @@ Company: {company_name}, Industry: {industry}
         # Extract components
         klos = self._extract_klos(topic_data)
         questions = self._extract_questions(topic_data)
-        activities = self._extract_activities(topic_data)
 
         if not klos:
             logger.warning("No KLOs found in adapted JSON, skipping KLO alignment fix")
             return adapted_json
 
-        logger.info(f"KLO Alignment Fixer (PARALLEL): {len(klos)} KLOs, {len(questions)} questions, {len(activities)} activities")
+        if not questions:
+            logger.warning("No questions found in adapted JSON, skipping KLO alignment fix")
+            return adapted_json
+
+        logger.info(f"KLO Alignment Fixer (PARALLEL): {len(klos)} KLOs, {len(questions)} questions")
 
         # Get context info
         factsheet = context.get("global_factsheet", {})
         company_name = factsheet.get("company", {}).get("name", "the company")
         industry = factsheet.get("company", {}).get("industry", "business")
 
-        # Process each KLO in PARALLEL
-        tasks = [
-            self._check_single_klo(klo, questions, activities, company_name, industry)
+        # Process each KLO in PARALLEL using create_task for TRUE parallelism
+        logger.info(f"Processing {len(klos)} KLOs in PARALLEL (semaphore limit: {MAX_CONCURRENT_LLM_CALLS})")
+        coroutines = [
+            self._check_and_fix_klo(klo, questions, company_name, industry)
             for klo in klos
         ]
-
+        # Create actual Task objects to force concurrent scheduling
+        tasks = [asyncio.create_task(coro) for coro in coroutines]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Collect results
-        klo_mapping = {}
-        fixes_needed = []
+        # Collect fixes
+        fixes = []
+        aligned_count = 0
+        misaligned_count = 0
 
         for i, result in enumerate(results):
             if isinstance(result, Exception):
@@ -1215,43 +1505,91 @@ Company: {company_name}, Industry: {industry}
                 continue
 
             klo_id = result.get("klo_id", f"klo_{i}")
-            klo_mapping[klo_id] = result.get("matching_items", [])
 
-            if not result.get("is_aligned", True) and result.get("suggested_fix"):
-                fixes_needed.append(result["suggested_fix"])
+            if result.get("is_aligned", True):
+                aligned_count += 1
+                logger.debug(f"KLO {klo_id}: ALIGNED (matched: {result.get('matched_question_id')})")
+            else:
+                misaligned_count += 1
+                if result.get("fix"):
+                    fixes.append(result["fix"])
+                    logger.info(f"KLO {klo_id}: MISALIGNED - will rewrite question {result['fix'].get('question_id')}")
 
-        logger.info(f"KLO Alignment complete: {len(klo_mapping)} KLOs checked, {len(fixes_needed)} fixes suggested")
-        logger.info(f"KLO Mapping: {json.dumps(klo_mapping, indent=2)[:500]}")
+        logger.info(f"KLO Alignment: {aligned_count} aligned, {misaligned_count} misaligned, {len(fixes)} fixes to apply")
 
-        # For now, return original - fixes would be applied here
-        # The main value is the alignment CHECK, not necessarily rewriting
+        # Apply fixes to JSON
+        if fixes:
+            fixed_json = self._apply_question_fixes(adapted_json, fixes)
+            logger.info(f"Applied {len(fixes)} question fixes")
+            return fixed_json
+
         return adapted_json
 
-    def _apply_fixes(self, adapted_json: dict, result: KLOAlignmentFixResponse) -> dict:
-        """Apply the KLO alignment fixes to the JSON."""
+    def _apply_question_fixes(self, adapted_json: dict, fixes: list) -> dict:
+        """
+        Apply question rewrites to the JSON.
+
+        Args:
+            adapted_json: The adapted JSON
+            fixes: List of fixes, each with {question_id, original_text, new_text}
+
+        Returns:
+            Fixed JSON with rewritten questions
+        """
         fixed_json = copy.deepcopy(adapted_json)
         topic_data = fixed_json.get("topicWizardData", {})
 
-        # Apply question fixes
-        for fixed_q in result.fixed_questions:
-            location = fixed_q.get("location", "")
-            new_question = fixed_q.get("question", fixed_q)
+        for fix in fixes:
+            question_id = fix.get("question_id")
+            new_text = fix.get("new_text")
 
-            # Try to find and update the question at the location
-            # This is a simplified approach - in production, use JSON Pointer
-            if "submissionQuestions" in location:
-                if "submissionQuestions" in topic_data:
-                    # Find matching question and update
-                    for i, q in enumerate(topic_data["submissionQuestions"]):
-                        if isinstance(new_question, dict) and new_question.get("id") == q.get("id"):
-                            topic_data["submissionQuestions"][i] = new_question
+            if not question_id or not new_text:
+                logger.warning(f"Invalid fix: {fix}")
+                continue
+
+            found = False
+
+            # 1. Check submissionQuestions
+            for q in topic_data.get("submissionQuestions", []):
+                if q.get("id") == question_id:
+                    old_text = q.get("question", "")[:50]
+                    q["question"] = new_text
+                    logger.info(f"Fixed submissionQuestion {question_id}: '{old_text}...' -> '{new_text[:50]}...'")
+                    found = True
+                    break
+
+            # 2. Check simulationFlow stages
+            if not found:
+                for stage in topic_data.get("simulationFlow", []):
+                    stage_data = stage.get("data", {})
+
+                    # Check questions in stage data
+                    for q in stage_data.get("questions", []):
+                        if q.get("id") == question_id:
+                            old_text = q.get("question", q.get("text", ""))[:50]
+                            if "question" in q:
+                                q["question"] = new_text
+                            else:
+                                q["text"] = new_text
+                            logger.info(f"Fixed simulationFlow question {question_id}: '{old_text}...' -> '{new_text[:50]}...'")
+                            found = True
                             break
 
-        # Apply activity fixes
-        for fixed_a in result.fixed_activities:
-            location = fixed_a.get("location", "")
-            # Similar logic for activities in simulationFlow
-            # In production, use JSON Pointer for precise updates
+                    # Check reflectionQuestions
+                    for q in stage_data.get("reflectionQuestions", []):
+                        if q.get("id") == question_id:
+                            old_text = q.get("question", "")[:50]
+                            q["question"] = new_text
+                            logger.info(f"Fixed reflectionQuestion {question_id}: '{old_text}...' -> '{new_text[:50]}...'")
+                            found = True
+                            break
+
+                    if found:
+                        break
+
+            if not found:
+                # Expected - LLM sometimes generates invalid question IDs
+                logger.debug(f"Could not find question {question_id} to fix")
 
         fixed_json["topicWizardData"] = topic_data
         return fixed_json

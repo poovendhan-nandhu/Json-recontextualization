@@ -400,15 +400,16 @@ class ContentPostProcessor:
         if not isinstance(content, dict):
             return content
 
-        # Apply fixes in order - truncation BEFORE trailing punctuation removal
+        # Apply fixes in order - entity corruption FIRST, then other fixes
+        content = self._fix_entity_corruption(content)  # Fix manager name embedded in company name
         content = self._fix_company_names(content)
-        content = self._fix_wrong_terms(content)  # NEW: Fix wrong industry terms
-        content = self._fix_truncated_text(content, "")  # First, fix truncated text
-        content = self._fix_trailing_punctuation(content)  # Then remove trailing periods
+        content = self._fix_wrong_terms(content)  # Fix wrong industry terms
+        content = self._fix_truncated_text(content, "")  # Fix truncated text
+        content = self._fix_trailing_punctuation(content)  # Remove trailing periods
         content = self._fix_gender_casing(content)
         content = self._fix_manager_consistency(content)
         content = self._remove_duplicates(content)
-        content = self._remove_empty_entries(content)  # NEW: Remove empty resource entries
+        content = self._remove_empty_entries(content)  # Remove empty resource entries
 
         return content
 
@@ -422,15 +423,22 @@ class ContentPostProcessor:
                     if isinstance(value[0], dict):
                         filtered = []
                         for item in value:
+                            # Handle mixed lists - some items might be strings
+                            if not isinstance(item, dict):
+                                filtered.append(item)
+                                continue
+
                             # Check if entry is essentially empty
-                            title = item.get('title', '') or item.get('name', '') or ''
-                            content = item.get('markdownText', '') or item.get('content', '') or item.get('description', '') or ''
+                            title = item.get('title', '') or item.get('name', '') or item.get('resourceTitle', '') or ''
+                            content = (item.get('markdownText', '') or item.get('content', '') or
+                                      item.get('description', '') or item.get('text', '') or
+                                      item.get('body', '') or item.get('resourceContent', '') or '')
 
                             # Keep if has meaningful content
                             if title.strip() or (content.strip() and len(content.strip()) > 10):
                                 filtered.append(self._remove_empty_entries(item))
                             else:
-                                logger.warning(f"Removing empty entry in {key}")
+                                logger.info(f"Removing empty entry in {key}: title='{title[:30] if title else ''}', content_len={len(content)}")
 
                         result[key] = filtered if filtered else value  # Keep original if all filtered
                     else:
@@ -597,6 +605,8 @@ class ContentPostProcessor:
         if not self.manager_info:
             return obj
 
+        manager_name = self.manager_info.get('name', '')
+
         if isinstance(obj, dict):
             result = {}
             for key, value in obj.items():
@@ -616,10 +626,91 @@ class ContentPostProcessor:
                         if 'gender' in value and self.manager_info.get('gender'):
                             value['gender'] = self.manager_info['gender'].capitalize()
 
+                # Fix email body signatures that have corrupted manager names
+                if key_lower in ('body', 'content', 'text', 'message') and isinstance(value, str) and manager_name:
+                    value = self._fix_email_signature(value, manager_name)
+
                 result[key] = self._fix_manager_consistency(value)
             return result
         elif isinstance(obj, list):
             return [self._fix_manager_consistency(item) for item in obj]
+        return obj
+
+    def _fix_email_signature(self, body: str, manager_name: str) -> str:
+        """Fix corrupted email signatures to use the correct manager name."""
+        import re
+
+        if not manager_name or not body:
+            return body
+
+        # Pattern to match common closing phrases followed by a name
+        # This catches things like "Regards,\nPractices Guide" or "Best,\nfor the"
+        closing_patterns = [
+            r'(Regards,?\s*\n\s*)([A-Za-z]+ [A-Za-z]+)',
+            r'(Best,?\s*\n\s*)([A-Za-z]+ [A-Za-z]+)',
+            r'(Sincerely,?\s*\n\s*)([A-Za-z]+ [A-Za-z]+)',
+            r'(Thanks,?\s*\n\s*)([A-Za-z]+ [A-Za-z]+)',
+            r'(Cheers,?\s*\n\s*)([A-Za-z]+ [A-Za-z]+)',
+            r'(Warm regards,?\s*\n\s*)([A-Za-z]+ [A-Za-z]+)',
+            r'(Kind regards,?\s*\n\s*)([A-Za-z]+ [A-Za-z]+)',
+            r'(All the best,?\s*\n\s*)([A-Za-z]+ [A-Za-z]+)',
+        ]
+
+        for pattern in closing_patterns:
+            match = re.search(pattern, body, re.IGNORECASE)
+            if match:
+                found_name = match.group(2)
+                # Check if the found name is NOT the expected manager name
+                if manager_name.lower() not in found_name.lower():
+                    # Check if found name looks like garbage (not a real name)
+                    # Real names usually have first letter caps: "Maya Sharma"
+                    # Garbage looks like: "practices and", "for the", "Practices Guide"
+                    words = found_name.split()
+                    if len(words) >= 2:
+                        # If the "name" contains common words that aren't names, replace it
+                        garbage_indicators = ['and', 'the', 'for', 'with', 'from', 'guide', 'practices', 'approaches']
+                        if any(w.lower() in garbage_indicators for w in words):
+                            # Replace with correct manager name
+                            body = body.replace(found_name, manager_name)
+                            logger.info(f"Fixed corrupted email signature: '{found_name}' -> '{manager_name}'")
+
+        return body
+
+    def _fix_entity_corruption(self, obj: Any) -> Any:
+        """
+        Fix corrupted entity names where one entity is incorrectly embedded in another.
+        E.g., "EcoChic TMaya Sharmaeads" -> "EcoChic Threads"
+
+        Uses factsheet values dynamically - no hardcoding.
+        """
+        if not self.company_name or not self.manager_info:
+            return obj
+
+        manager_name = self.manager_info.get('name', '')
+        if not manager_name:
+            return obj
+
+        if isinstance(obj, str):
+            # Check if manager name appears INSIDE what should be company name
+            # Pattern: company_prefix + manager_name + company_suffix
+            if manager_name in obj and self.company_name not in obj:
+                # Try to detect corrupted company name
+                # Look for pattern where manager name is embedded incorrectly
+                import re
+                # Escape special regex chars in manager name
+                escaped_manager = re.escape(manager_name)
+                # Pattern: word chars + manager name + word chars (not at word boundary)
+                pattern = rf'(\w+){escaped_manager}(\w+)'
+                match = re.search(pattern, obj)
+                if match:
+                    # This looks like corruption - replace with company name
+                    corrupted = match.group(0)
+                    obj = obj.replace(corrupted, self.company_name)
+            return obj
+        elif isinstance(obj, dict):
+            return {k: self._fix_entity_corruption(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._fix_entity_corruption(item) for item in obj]
         return obj
 
     def _remove_duplicates(self, obj: Any) -> Any:
@@ -630,8 +721,9 @@ class ContentPostProcessor:
                 if isinstance(value, list) and value:
                     # Check if this is a list of objects that might have duplicates
                     if isinstance(value[0], dict):
-                        # Check multiple possible name fields for activities/questions
-                        name_fields = ['name', 'title', 'activityName', 'questionText', 'text', 'description']
+                        # Check multiple possible name fields for activities/questions/rubrics
+                        name_fields = ['name', 'title', 'activityName', 'questionText', 'text', 'description',
+                                      'question', 'reviewQuestion', 'keyLearningOutcome']
                         name_field = None
                         for field in name_fields:
                             if field in value[0]:
@@ -642,6 +734,11 @@ class ContentPostProcessor:
                             seen_names = set()
                             unique_items = []
                             for item in value:
+                                # Handle mixed lists - some items might be strings
+                                if not isinstance(item, dict):
+                                    unique_items.append(item)
+                                    continue
+
                                 name = item.get(name_field, '').lower().strip()
                                 # Also check description for near-duplicates
                                 desc = item.get('description', '')[:50].lower().strip() if item.get('description') else ''
@@ -653,7 +750,7 @@ class ContentPostProcessor:
                                 elif not identifier:
                                     unique_items.append(item)
                                 else:
-                                    logger.warning(f"Removing duplicate: {name}")
+                                    logger.debug(f"Removing duplicate: {name}")
                             result[key] = [self._remove_duplicates(item) for item in unique_items]
                         else:
                             result[key] = [self._remove_duplicates(item) for item in value]
@@ -667,14 +764,19 @@ class ContentPostProcessor:
         return obj
 
     def _fix_truncated_text(self, obj: Any, parent_key: str = "") -> Any:
-        """Fix text that was truncated mid-sentence. Skip name/email/role fields."""
+        """Fix text that was truncated mid-sentence. Skip name/email/role/URL fields."""
         if isinstance(obj, str):
             # Skip fields that shouldn't have periods added
             parent_lower = parent_key.lower()
             if parent_lower in ('name', 'fullname', 'email', 'senderemail', 'role',
                                'title', 'designation', 'jobtitle', 'avatarurl',
-                               'imageurl', 'url', 'organizationname', 'gender'):
+                               'imageurl', 'url', 'organizationname', 'gender',
+                               'videourl', 'fileurl', 'attachmenturl', 'src', 'href'):
                 return obj  # Don't modify these fields
+
+            # CRITICAL: Skip URLs entirely - they should never get periods added
+            if obj.startswith('http://') or obj.startswith('https://') or obj.startswith('//'):
+                return obj  # Don't touch URLs
 
             if len(obj) < 10:
                 return obj
@@ -878,7 +980,18 @@ def post_process_content(
         wrong_terms=wrong_terms
     )
 
-    return processor.process(content)
+    processed = processor.process(content)
+
+    # Apply content quality fixes (duplicates, truncation)
+    from .content_fixer import fix_content_issues
+    fixed_content, fixes_applied = fix_content_issues(processed)
+
+    if fixes_applied:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Content fixer applied {len(fixes_applied)} fixes: {fixes_applied[:5]}")
+
+    return fixed_content
 
 
 def analyze_and_get_feedback(alignment_report: Dict[str, Any]) -> Tuple[AlignmentFeedback, str]:

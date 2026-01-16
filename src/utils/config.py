@@ -77,13 +77,23 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
         "name": "Industry Aligned Activities",
         "paths": [
             "topicWizardData.industryAlignedActivities",
-            "topicWizardData.selectedIndustryAlignedActivities",  # ✅ ADDED - was missing!
-            "topicWizardData.chatHistory.industryAlignedActivities",
+            "topicWizardData.selectedIndustryAlignedActivities",
+            # NOTE: chatHistory.industryAlignedActivities moved to locked shard
         ],
         "locked": False,  # ✅ NOW UNLOCKED - content adapts
         "is_blocker": False,
         "parallel": True,
         "aligns_with": ["assessment_criteria", "workplace_scenario"],
+    },
+    "activities_chat_history": {
+        "name": "Activities Chat History",
+        "paths": [
+            "topicWizardData.chatHistory.industryAlignedActivities",
+        ],
+        "locked": False,  # UNLOCKED: Activities must align to new scenario/industry
+        "is_blocker": True,
+        "parallel": True,
+        "aligns_with": ["simulation_flow", "workplace_scenario"],
     },
     "selected_scenario": {
         "name": "Selected Scenario",
@@ -111,10 +121,10 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
         "paths": [
             "topicWizardData.chatHistory.scenarioDescription",
         ],
-        "locked": False,  # Content changes, but structure/IDs preserved
-        "is_blocker": False,
+        "locked": False,  # UNLOCKED: Contains manager/company refs that MUST match new scenario
+        "is_blocker": True,  # Blocker because it has entity references
         "parallel": True,
-        "aligns_with": ["workplace_scenario"],
+        "aligns_with": ["workplace_scenario", "emails"],
     },
     "simulation_flow": {
         "name": "Simulation Flow (Stages)",
@@ -203,13 +213,13 @@ class Config:
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
     # Workflow Settings
-    MAX_RETRIES: int = 3
-    MAX_FIX_ATTEMPTS: int = 3
+    MAX_RETRIES: int = 1  # Reduced from 3 - single pass for faster completion
+    MAX_FIX_ATTEMPTS: int = 1  # Reduced from 3 - single pass for faster completion
     CONSISTENCY_THRESHOLD: float = 0.85
 
     # Compliance Thresholds
     BLOCKER_PASS_RATE_REQUIRED: float = 1.0   # Blockers must pass 100%
-    OVERALL_SCORE_REQUIRED: float = 0.98      # Overall must be >= 98%
+    OVERALL_SCORE_REQUIRED: float = 0.95      # Overall must be >= 95%
 
     # Locked Fields (immutable) - Only system IDs now
     LOCKED_FIELDS: list[str] = [
@@ -329,11 +339,28 @@ INFERENCE_INTEGRITY_PATTERNS: list[str] = [
 ]
 
 # Word count limits by section type
+# Shweta Requirement Dec 22: "is the resource within like 1500 words"
 WORD_COUNT_LIMITS: dict[str, dict[str, int]] = {
     "intro_email": {"min": 50, "max": 300},
     "task_email": {"min": 100, "max": 500},
-    "resource": {"min": 200, "max": 3000},
+    "resource": {"min": 200, "max": 1500},  # ← Changed from 3000 per Shweta's requirement
     "rubric_criteria": {"min": 20, "max": 200},
     "workplace_scenario": {"min": 100, "max": 800},
     "klo_description": {"min": 10, "max": 150},
 }
+
+# =============================================================================
+# VALIDATION THRESHOLDS (Shweta Requirements)
+# =============================================================================
+
+# Shweta Requirement Dec 22: "You basically say you start with 98%"
+VALIDATION_THRESHOLD: float = 0.98  # Start with 98%, can lower to 95% if needed
+MINIMUM_ACCEPTABLE_THRESHOLD: float = 0.95  # Never go below 95%
+
+# Threshold enforcement modes
+class ThresholdMode:
+    STRICT = "strict"      # Block if below 98%
+    FLEXIBLE = "flexible"  # Block if below 95%, warn if below 98%
+    LENIENT = "lenient"    # Only warn, never block based on threshold
+
+THRESHOLD_MODE = ThresholdMode.STRICT  # Default to strict per Shweta

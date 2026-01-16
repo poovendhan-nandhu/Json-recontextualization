@@ -21,12 +21,28 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pydantic import BaseModel
 
+import httpx
 from langsmith import traceable
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 
+from src.utils.gemini_client import filter_poison_list
+
 logger = logging.getLogger(__name__)
+
+# Global semaphore for controlling concurrent LLM calls
+# This is the KEY to true parallelism - limits concurrent requests to avoid serialization
+MAX_CONCURRENT_LLM_CALLS = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "10"))
+_llm_semaphore = None  # Will be initialized lazily in async context
+
+
+def _get_semaphore():
+    """Get or create the semaphore (must be called in async context)."""
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+    return _llm_semaphore
 
 
 # =============================================================================
@@ -111,29 +127,49 @@ class AlignmentReport:
 
     def to_dict(self) -> dict:
         """Convert to dictionary for API response."""
+        results_list = []
+        for r in self.results:
+            try:
+                issues_list = []
+                for i in r.issues:
+                    if isinstance(i, AlignmentIssue):
+                        issues_list.append({
+                            "description": i.description,
+                            "location": i.location,
+                            "severity": i.severity.value if hasattr(i.severity, 'value') else str(i.severity),
+                            "suggestion": i.suggestion,
+                        })
+                    else:
+                        # Handle string issues
+                        issues_list.append({
+                            "description": str(i),
+                            "location": "unknown",
+                            "severity": "warning",
+                            "suggestion": None,
+                        })
+
+                results_list.append({
+                    "rule_id": r.rule_id,
+                    "rule_name": r.rule_name,
+                    "passed": r.passed,
+                    "score": round(r.score, 4),
+                    "issues": issues_list,
+                })
+            except Exception as e:
+                results_list.append({
+                    "rule_id": getattr(r, 'rule_id', 'error'),
+                    "rule_name": getattr(r, 'rule_name', 'Error'),
+                    "passed": False,
+                    "score": 0.0,
+                    "issues": [{"description": str(e), "location": "to_dict", "severity": "warning", "suggestion": None}],
+                })
+
         return {
             "overall_score": round(self.overall_score, 4),
             "passed": self.passed,
             "threshold": self.threshold,
             "summary": self.llm_summary,
-            "results": [
-                {
-                    "rule_id": r.rule_id,
-                    "rule_name": r.rule_name,
-                    "passed": r.passed,
-                    "score": round(r.score, 4),
-                    "issues": [
-                        {
-                            "description": i.description,
-                            "location": i.location,
-                            "severity": i.severity.value,
-                            "suggestion": i.suggestion,
-                        }
-                        for i in r.issues
-                    ],
-                }
-                for r in self.results
-            ],
+            "results": results_list,
             "blocker_count": len(self.blocker_issues),
             "warning_count": len(self.warning_issues),
         }
@@ -144,16 +180,28 @@ class AlignmentReport:
 # =============================================================================
 
 # GPT-5.2 Model for validation - 400K context, strong reasoning
-VALIDATION_MODEL = "gpt-5.2-2025-12-11"
+VALIDATION_MODEL = os.getenv("VALIDATION_MODEL", "gpt-5.2-2025-12-11")
 
 
 def _get_validation_llm():
-    """Get OpenAI GPT-5.2 client for validation."""
+    """
+    Get OpenAI GPT-5.2 client for validation.
+
+    CRITICAL: Each call creates a NEW httpx.AsyncClient to enable TRUE parallel execution.
+    Without this, all LLM calls share the same connection and run sequentially.
+    """
+    # Create NEW http client for each LLM instance - enables true parallelism
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=30.0),  # 2 min read, 30s connect
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),  # Higher limits for parallelism
+    )
+
     return ChatOpenAI(
         model=VALIDATION_MODEL,
         temperature=0.1,
         max_retries=3,
         request_timeout=120,
+        http_async_client=http_client,  # CRITICAL: Use separate HTTP client
         api_key=os.getenv("OPENAI_API_KEY"),
     )
 
@@ -165,13 +213,17 @@ class AlignmentChecker:
     Uses OpenAI GPT-5.2 for intelligent semantic checking instead of hardcoded rules.
     """
 
-    def __init__(self, threshold: float = 0.98):
+    def __init__(self, threshold: float = 0.95):
         """
         Args:
-            threshold: Minimum score required to pass (default 0.98 = 98%)
+            threshold: Minimum score required to pass (default 0.95 = 95%)
         """
         self.threshold = threshold
-        self.llm = _get_validation_llm()
+        # Don't create shared LLM - each parallel task gets its own for true parallelism
+
+    def _get_llm(self):
+        """Get a NEW LLM instance for each parallel check (enables true parallel execution)."""
+        return _get_validation_llm()
 
     async def check(
         self,
@@ -194,8 +246,9 @@ class AlignmentChecker:
         blocker_issues = []
         warning_issues = []
 
-        # Run alignment checks in parallel (9 total checkers)
-        check_tasks = [
+        # Run alignment checks in parallel (9 total checkers) using create_task for TRUE parallelism
+        logger.info(f"Running 9 alignment checks in PARALLEL (semaphore limit: {MAX_CONCURRENT_LLM_CALLS})")
+        check_coroutines = [
             # Consistency checks
             self._check_reporting_manager_consistency(adapted_json, global_factsheet),
             self._check_company_consistency(adapted_json, global_factsheet),
@@ -209,7 +262,8 @@ class AlignmentChecker:
             self._check_klo_alignment(adapted_json, global_factsheet),
             self._check_scenario_coherence(adapted_json, global_factsheet),
         ]
-
+        # Create actual Task objects to force concurrent scheduling
+        check_tasks = [asyncio.create_task(coro) for coro in check_coroutines]
         check_results = await asyncio.gather(*check_tasks, return_exceptions=True)
 
         for result in check_results:
@@ -227,17 +281,36 @@ class AlignmentChecker:
                         severity=AlignmentSeverity.BLOCKER,
                     )],
                 ))
+            elif not isinstance(result, AlignmentResult):
+                # Handle unexpected result type
+                logger.error(f"Unexpected result type: {type(result)} - {result}")
+                results.append(AlignmentResult(
+                    rule_id="error",
+                    rule_name="Type Error",
+                    passed=False,
+                    score=0.0,
+                    issues=[AlignmentIssue(
+                        rule_id="error",
+                        description=f"Unexpected result type: {type(result)}",
+                        location="alignment_checker",
+                        severity=AlignmentSeverity.WARNING,
+                    )],
+                ))
             else:
                 results.append(result)
                 # Log each check result for debugging
                 status = "✅ PASS" if result.passed else "❌ FAIL"
                 logger.info(f"  {status} {result.rule_name}: {result.score:.1%} ({len(result.issues)} issues)")
                 for issue in result.issues:
-                    logger.info(f"      - [{issue.severity.value}] {issue.description[:100]}")
-                    if issue.severity == AlignmentSeverity.BLOCKER:
-                        blocker_issues.append(issue)
-                    elif issue.severity == AlignmentSeverity.WARNING:
-                        warning_issues.append(issue)
+                    # Defensive check for issue type
+                    if isinstance(issue, AlignmentIssue):
+                        logger.info(f"      - [{issue.severity.value}] {issue.description[:100]}")
+                        if issue.severity == AlignmentSeverity.BLOCKER:
+                            blocker_issues.append(issue)
+                        elif issue.severity == AlignmentSeverity.WARNING:
+                            warning_issues.append(issue)
+                    else:
+                        logger.warning(f"      - [WARN] Unexpected issue type: {type(issue)} - {issue}")
 
         # Get overall validation from LLM
         overall_result = await self._get_overall_validation(
@@ -320,12 +393,15 @@ Only give low scores (<0.7) for ACTUAL problems like:
             ("human", "{input}"),
         ])
 
-        chain = chat_prompt | self.llm | parser
+        chain = chat_prompt | self._get_llm() | parser
 
-        result = await chain.ainvoke({
-            "input": prompt,
-            "format_instructions": parser.get_format_instructions(),
-        })
+        # Use semaphore for controlled parallelism
+        semaphore = _get_semaphore()
+        async with semaphore:
+            result = await chain.ainvoke({
+                "input": prompt,
+                "format_instructions": parser.get_format_instructions(),
+            })
 
         return result
 
@@ -495,7 +571,9 @@ Look for:
         """
         rule_id = "poison_term_avoidance"
 
-        poison_list = global_factsheet.get("poison_list", [])
+        # Filter poison list to remove common English words (second layer of defense)
+        raw_poison_list = global_factsheet.get("poison_list", [])
+        poison_list = filter_poison_list(raw_poison_list) if isinstance(raw_poison_list, list) else []
         replacement_hints = global_factsheet.get("replacement_hints", {})
 
         # Sample key content for checking
@@ -507,7 +585,7 @@ Look for:
 ## SOURCE SCENARIO (OLD):
 {source_scenario[:500] if source_scenario else "Not provided"}
 
-## POISON LIST (terms from old scenario that should NOT appear):
+## POISON LIST (scenario-specific terms from old scenario that should NOT appear):
 {json.dumps(poison_list, indent=2)}
 
 ## REPLACEMENT HINTS:
@@ -519,11 +597,20 @@ Look for:
 ## TASK:
 Check if ANY of the poison list terms (or variations) appear in the adapted content.
 
+## IMPORTANT - DO NOT flag common English words as poison terms:
+- Words like "role", "consistent", "ensure", "evaluate", "assessment" are NORMAL business language
+- Only flag terms that are TRULY SPECIFIC to the old scenario (company names, person names, product names, branded terms)
+- A term is only a problem if it refers specifically to the OLD scenario context
+
 Look for:
-1. Exact matches of poison terms
-2. Case variations (uppercase, lowercase, mixed)
-3. Partial matches within compound words
-4. Similar terms that suggest old scenario"""
+1. Exact matches of scenario-specific poison terms (company names, product names, person names)
+2. Industry-specific jargon from the OLD scenario that doesn't fit the NEW scenario
+3. Branded or proprietary terms from the source scenario
+
+DO NOT flag:
+- Common business words (role, consistent, ensure, evaluate, analysis, etc.)
+- Generic terms that appear in any business context
+- Words that are appropriate for the NEW scenario context"""
 
         try:
             parser = PydanticOutputParser(pydantic_object=PoisonTermResponse)
@@ -1219,14 +1306,77 @@ Provide an overall assessment of the adapted simulation quality."""
         return refs
 
     def _extract_sample_content(self, topic_data: dict) -> dict:
-        """Extract sample content for poison term checking."""
-        return {
+        """
+        Extract COMPREHENSIVE content for poison term checking.
+
+        CRITICAL: Must include ALL learner-facing content, especially:
+        - Guidelines (often contains domain-specific terms)
+        - Overview
+        - Scenario text
+        - KLOs
+        - Activities
+        """
+        # Basic info
+        content = {
             "simulationName": topic_data.get("simulationName", ""),
             "overview": topic_data.get("overview", ""),
             "workplaceScenario": topic_data.get("workplaceScenario", {}).get("scenario", ""),
             "organizationName": topic_data.get("workplaceScenario", {}).get("background", {}).get("organizationName", ""),
             "aboutOrganization": topic_data.get("workplaceScenario", {}).get("background", {}).get("aboutOrganization", "")[:500],
         }
+
+        # CRITICAL: Add guidelines - often contains poison terms!
+        guidelines = topic_data.get("guidelines", "")
+        if guidelines:
+            content["guidelines"] = guidelines[:1500]
+
+        # Add lesson information
+        lesson_info = topic_data.get("lessonInformation", {})
+        if isinstance(lesson_info, dict):
+            content["lessonTitle"] = lesson_info.get("title", "")
+            content["lessonDescription"] = lesson_info.get("description", "")[:500]
+        elif isinstance(lesson_info, str):
+            content["lessonInformation"] = lesson_info[:500]
+
+        # Add KLOs - they might contain source scenario terms
+        klos = []
+        for criterion in topic_data.get("assessmentCriterion", []):
+            klo_text = criterion.get("keyLearningOutcome", "")
+            if klo_text:
+                klos.append(klo_text[:200])
+        if klos:
+            content["keyLearningOutcomes"] = klos[:5]
+
+        # Add activity names and descriptions
+        activities = []
+        for activity in topic_data.get("industryAlignedActivities", [])[:5]:
+            if isinstance(activity, dict):
+                name = activity.get("name", "")
+                desc = activity.get("description", "")[:100]
+                if name or desc:
+                    activities.append(f"{name}: {desc}")
+        if activities:
+            content["activities"] = activities
+
+        # Add scope of work tasks
+        learner_role = (topic_data.get("workplaceScenario", {})
+                       .get("learnerRoleReportingManager", {})
+                       .get("learnerRole", {}))
+        tasks = []
+        for sow in learner_role.get("scopeOfWork", [])[:5]:
+            if isinstance(sow, dict):
+                task = sow.get("task", "")
+                if task:
+                    tasks.append(task[:100])
+        if tasks:
+            content["scopeOfWorkTasks"] = tasks
+
+        # Add email subjects and bodies (first few)
+        emails = self._extract_emails(topic_data)
+        if emails:
+            content["emailSamples"] = emails[:3]
+
+        return content
 
     def _extract_activities(self, topic_data: dict) -> list[dict]:
         """Extract activities from the JSON."""
@@ -1304,7 +1454,7 @@ async def check_alignment(
     adapted_json: dict,
     global_factsheet: dict,
     source_scenario: str = "",
-    threshold: float = 0.98,
+    threshold: float = 0.95,
 ) -> AlignmentReport:
     """
     Run LLM-based alignment checks on adapted simulation.

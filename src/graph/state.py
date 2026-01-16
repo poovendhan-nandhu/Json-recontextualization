@@ -78,6 +78,7 @@ class PipelineState(TypedDict, total=False):
     compliance_passed: bool                   # Did compliance pass?
     compliance_iteration: int                 # Which iteration of compliance loop
     flagged_for_human: list[str]              # Shard IDs needing human review
+    human_readable_report: str                # Markdown validation report for PM/QA
 
     # ==========================================================================
     # STAGE 7: HUMAN APPROVAL
@@ -171,6 +172,7 @@ def create_initial_state(
         compliance_passed=False,
         compliance_iteration=0,
         flagged_for_human=[],
+        human_readable_report="",
         approval_package={},
         approval_status="pending",
         reviewer=None,

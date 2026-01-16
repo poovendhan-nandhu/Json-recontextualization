@@ -22,6 +22,9 @@ from .prompts import (
     build_factsheet_prompt,
     build_shard_adaptation_prompt,
     build_regeneration_prompt,
+    strict_verify_output,
+    VerificationResult,
+    extract_adapted_content,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,149 @@ except ImportError:
 
 _gemini_model = None
 _executor = ThreadPoolExecutor(max_workers=10)
+
+# =============================================================================
+# POISON LIST FILTERING - Remove common English words to reduce false positives
+# =============================================================================
+
+# Common English words that should NOT be treated as poison terms
+# These are too generic and appear in any business context
+COMMON_ENGLISH_WORDS = {
+    # Common business words
+    "role", "roles", "team", "teams", "work", "working", "job", "jobs",
+    "process", "processes", "project", "projects", "task", "tasks",
+    "goal", "goals", "target", "targets", "result", "results",
+    "consistent", "consistency", "consistently", "ensure", "ensuring",
+    "equitable", "equity", "fair", "fairly", "accurate", "accurately",
+    "efficient", "efficiently", "effective", "effectively",
+    "quality", "improve", "improved", "improvement", "improving",
+    "evaluate", "evaluation", "evaluations", "evaluating",
+    "assess", "assessment", "assessments", "assessing",
+    "analysis", "analyze", "analyzing", "analytical",
+    "decision", "decisions", "decide", "deciding",
+    "strategy", "strategic", "strategies",
+    "plan", "planning", "plans", "planned",
+    "manage", "management", "managing", "manager", "managers",
+    "lead", "leader", "leadership", "leading",
+    "support", "supporting", "supports",
+    "develop", "development", "developing",
+    "review", "reviewing", "reviews", "reviewed",
+    # Common adjectives
+    "best", "better", "good", "great", "important", "key", "main",
+    "new", "first", "last", "next", "previous", "current",
+    "high", "low", "top", "bottom",
+    # Common verbs
+    "make", "making", "take", "taking", "give", "giving",
+    "use", "using", "used", "find", "finding", "found",
+    "get", "getting", "see", "seeing", "look", "looking",
+    "know", "knowing", "think", "thinking",
+    # Time words
+    "time", "day", "week", "month", "year", "today", "tomorrow",
+    # Common nouns
+    "way", "ways", "thing", "things", "part", "parts",
+    "person", "people", "group", "groups",
+    "data", "information", "report", "reports",
+    "meeting", "meetings", "email", "emails",
+    # Numbers/amounts
+    "one", "two", "three", "many", "few", "all", "some", "most",
+}
+
+
+def filter_poison_list(poison_list: list) -> list:
+    """
+    Filter out common English words from the poison list.
+
+    Only keeps terms that are truly scenario-specific:
+    - Proper nouns (company names, person names)
+    - Industry-specific jargon
+    - Branded terms
+
+    Returns filtered list with only scenario-specific terms.
+    """
+    if not isinstance(poison_list, list):
+        return []
+
+    filtered = []
+    for term in poison_list:
+        if not isinstance(term, str):
+            continue
+        term_lower = term.lower().strip()
+
+        # Skip empty terms
+        if not term_lower:
+            continue
+
+        # Skip single-character terms
+        if len(term_lower) <= 2:
+            continue
+
+        # Skip common English words (case-insensitive)
+        if term_lower in COMMON_ENGLISH_WORDS:
+            logger.debug(f"Filtered common word from poison list: {term}")
+            continue
+
+        # Keep multi-word terms (likely proper nouns/brand names)
+        # Keep terms with capital letters (likely proper nouns)
+        # Keep terms not in common words list
+        filtered.append(term)
+
+    logger.info(f"Poison list filtered: {len(poison_list)} -> {len(filtered)} terms")
+    return filtered
+
+
+def extract_names_from_text(text: str) -> list[str]:
+    """
+    Extract person names from text using pattern matching.
+
+    Looks for patterns like:
+    - "Name Name" (two capitalized words)
+    - Common name patterns in business contexts
+
+    Returns list of extracted names.
+    """
+    import re
+
+    names = set()
+
+    # Pattern for "First Last" names (two capitalized words)
+    name_pattern = r'\b([A-Z][a-z]+)\s+([A-Z][a-z]+)\b'
+    matches = re.findall(name_pattern, text)
+    for first, last in matches:
+        # Skip common phrases that match pattern
+        skip_phrases = {'The Company', 'Market Entry', 'Key Learning', 'Learning Outcome',
+                       'Business Case', 'Project Manager', 'Team Lead', 'Data Analysis'}
+        full_name = f"{first} {last}"
+        if full_name not in skip_phrases:
+            names.add(full_name)
+            names.add(first)  # Also add first name alone
+
+    return list(names)
+
+
+def augment_poison_list_with_names(poison_list: list, source_text: str) -> list:
+    """
+    Augment poison list with any person names found in source scenario.
+
+    This ensures names like "Elizabeth Carter" are always included even if
+    the LLM misses them in the factsheet extraction.
+
+    Only extracts PERSON NAMES using regex - no hardcoded domain terms.
+    Domain-specific terms should come from the LLM factsheet extraction.
+    """
+    extracted_names = extract_names_from_text(source_text)
+
+    existing_lower = {t.lower() for t in poison_list if isinstance(t, str)}
+
+    added = []
+    for name in extracted_names:
+        if name.lower() not in existing_lower:
+            poison_list.append(name)
+            added.append(name)
+
+    if added:
+        logger.info(f"[POISON LIST] Auto-extracted {len(added)} names from source: {added[:10]}...")
+
+    return poison_list
 
 
 def _get_gemini():
@@ -141,20 +287,29 @@ def _repair_json(text: str) -> dict:
     return json.loads(text)
 
 
-def _call_gemini_sync(prompt: str, temperature: float = 0.3) -> dict:
+def _call_gemini_sync(prompt: str, temperature: float = 0.3, max_tokens: int = 65536) -> dict:
     """Synchronous Gemini call."""
-    model = _get_gemini()
+    import time
+    start = time.time()
 
+    model = _get_gemini()
+    init_time = time.time() - start
+    logger.info(f"[GEMINI] Model init: {init_time:.2f}s, prompt: {len(prompt)} chars, max_tokens: {max_tokens}")
+
+    call_start = time.time()
     response = model.generate_content(
         prompt,
         generation_config={
             "temperature": temperature,
-            "max_output_tokens": 65536,
+            "max_output_tokens": max_tokens,
             "response_mime_type": "application/json",
         }
     )
+    call_time = time.time() - call_start
+    logger.info(f"[GEMINI] API call took: {call_time:.2f}s")
 
     text = response.text.strip()
+    logger.info(f"[GEMINI] Response: {len(text)} chars")
 
     try:
         return _repair_json(text)
@@ -164,12 +319,15 @@ def _call_gemini_sync(prompt: str, temperature: float = 0.3) -> dict:
         raise
 
 
-async def call_gemini(prompt: str, temperature: float = 0.3) -> dict:
+async def call_gemini(prompt: str, temperature: float = 0.3, max_tokens: int = 65536) -> dict:
     """Async Gemini call with retry."""
     loop = asyncio.get_event_loop()
 
     async def _call():
-        return await loop.run_in_executor(_executor, _call_gemini_sync, prompt, temperature)
+        return await loop.run_in_executor(
+            _executor,
+            lambda: _call_gemini_sync(prompt, temperature, max_tokens)
+        )
 
     config = RetryConfig(
         max_attempts=2,
@@ -206,15 +364,19 @@ async def extract_global_factsheet(
     Returns:
         Global factsheet dict
     """
-    safe_source = safe_str(source_scenario)
-    safe_target = safe_str(target_scenario)
+    # Truncate scenarios to reasonable size - full text isn't needed for factsheet
+    # Keeps first 2000 chars which contains the key info
+    safe_source = safe_str(source_scenario)[:2000]
+    safe_target = safe_str(target_scenario)[:2000]
 
     # Build prompt from prompts.py
     prompt = build_factsheet_prompt(safe_source, safe_target)
+    logger.info(f"Factsheet prompt size: {len(prompt)} chars")
 
     with StatsTimer("global_factsheet") as timer:
         try:
-            result = await call_gemini(prompt, temperature=0.2)
+            # Increased max_tokens to ensure complete factsheet
+            result = await call_gemini(prompt, temperature=0.2, max_tokens=8192)
             get_stats().add_call(
                 success=True,
                 shard_id="global_factsheet",
@@ -225,9 +387,40 @@ async def extract_global_factsheet(
             if not isinstance(result, dict):
                 logger.warning(f"Factsheet returned unexpected type: {type(result)}")
                 result = {}
-            poison_list = result.get('poison_list', [])
-            poison_count = len(poison_list) if isinstance(poison_list, list) else 0
-            logger.info(f"Extracted global factsheet with {poison_count} poison terms")
+
+            # === VALIDATE FACTSHEET COMPLETENESS ===
+            required_fields = ['company', 'reporting_manager', 'poison_list', 'industry_context', 'learner_role']
+            missing = [f for f in required_fields if not result.get(f)]
+            if missing:
+                logger.warning(f"[FACTSHEET] Missing required fields: {missing}")
+                # Fill in defaults for missing fields
+                if 'reporting_manager' not in result or not result.get('reporting_manager'):
+                    result['reporting_manager'] = {
+                        'name': 'Unknown Manager',
+                        'role': 'Director',
+                        'email': 'manager@company.com',
+                        'gender': 'Unknown'
+                    }
+                if 'poison_list' not in result or not result.get('poison_list'):
+                    result['poison_list'] = []
+                if 'industry_context' not in result or not result.get('industry_context'):
+                    result['industry_context'] = {'kpis': [], 'terminology': [], 'wrong_terms': []}
+                if 'learner_role' not in result or not result.get('learner_role'):
+                    result['learner_role'] = {'role': 'Analyst', 'key_responsibilities': []}
+
+            # Filter poison list to remove common English words (reduces false positives)
+            raw_poison_list = result.get('poison_list', [])
+            raw_count = len(raw_poison_list) if isinstance(raw_poison_list, list) else 0
+            filtered_poison_list = filter_poison_list(raw_poison_list)
+
+            # CRITICAL: Augment poison list with names extracted from source scenario
+            # This ensures person names like "Elizabeth Carter" are always included
+            augmented_poison_list = augment_poison_list_with_names(filtered_poison_list, source_scenario)
+            result['poison_list'] = augmented_poison_list
+
+            manager_obj = result.get('reporting_manager', {})
+            manager_name = manager_obj.get('name', 'Unknown') if isinstance(manager_obj, dict) else 'Unknown'
+            logger.info(f"[FACTSHEET] ✅ Extracted: {raw_count} poison terms -> {len(augmented_poison_list)} after filtering+augmenting, manager={manager_name}")
             return result
         except Exception as e:
             get_stats().add_call(
@@ -259,9 +452,16 @@ async def adapt_shard_content(
     target_scenario: str,
     global_factsheet: dict = None,
     rag_context: str = "",
+    max_verification_retries: int = 2,
 ) -> tuple[dict, dict]:
     """
     Adapt a single shard's content using the global factsheet.
+
+    NOW WITH VERIFICATION LOOP:
+    1. Generate adapted content
+    2. Run strict_verify_output() to catch issues
+    3. If verification fails, regenerate with specific feedback
+    4. Repeat until pass or max retries
 
     Args:
         shard_id: Shard identifier
@@ -271,6 +471,7 @@ async def adapt_shard_content(
         target_scenario: Target scenario text
         global_factsheet: Pre-extracted global facts (CRITICAL for consistency)
         rag_context: Additional context from RAG
+        max_verification_retries: Max regeneration attempts on verification failure
 
     Returns:
         (adapted_content, entity_mappings)
@@ -278,6 +479,7 @@ async def adapt_shard_content(
     safe_source = safe_str(source_scenario)[:200]
     safe_target = safe_str(target_scenario)[:200]
     safe_rag = safe_str(rag_context) if rag_context else ""
+    factsheet = global_factsheet if isinstance(global_factsheet, dict) else {}
 
     # Build prompt using prompts.py (centralized prompt management)
     prompt = build_shard_adaptation_prompt(
@@ -286,12 +488,13 @@ async def adapt_shard_content(
         content=content,
         source_scenario=safe_source,
         target_scenario=safe_target,
-        global_factsheet=global_factsheet,
+        global_factsheet=factsheet,
         rag_context=safe_rag,
     )
 
     with StatsTimer(shard_id) as timer:
         try:
+            # === PASS 1: Initial generation ===
             result = await call_gemini(prompt, temperature=0.3)
 
             if isinstance(result, list) and len(result) > 0:
@@ -300,8 +503,53 @@ async def adapt_shard_content(
                 logger.warning(f"Shard {shard_id} returned unexpected type: {type(result)}")
                 return content, {}
 
-            adapted_content = result.get("adapted_content", content)
-            entity_mappings = result.get("entity_mappings", {})
+            # === VERIFICATION GATE ===
+            verification = strict_verify_output(result, factsheet, check_verification_fields=True)
+
+            retry_count = 0
+            while not verification.passed and retry_count < max_verification_retries:
+                retry_count += 1
+                logger.warning(f"[VERIFY] Shard {shard_id} failed verification (attempt {retry_count}): {verification.errors[:3]}")
+
+                # Build feedback from verification errors
+                feedback = {
+                    "failed_rules": verification.errors,
+                    "critical_issues": verification.errors,
+                    "poison_terms_found": [e for e in verification.errors if "POISON" in e],
+                    "placeholders_found": [e for e in verification.errors if "PLACEHOLDER" in e],
+                    "sender_mismatches": [e for e in verification.errors if "SENDER" in e],
+                }
+
+                # Regenerate with specific feedback
+                regen_prompt = build_regeneration_prompt(
+                    shard_id=shard_id,
+                    shard_name=shard_name,
+                    content=result.get("adapted_content", result) if isinstance(result, dict) else result,
+                    source_scenario=safe_source,
+                    target_scenario=safe_target,
+                    global_factsheet=factsheet,
+                    feedback=feedback,
+                )
+
+                result = await call_gemini(regen_prompt, temperature=0.2)
+
+                if isinstance(result, list) and len(result) > 0:
+                    result = result[0] if isinstance(result[0], dict) else {}
+                if not isinstance(result, dict):
+                    break
+
+                # Re-verify
+                verification = strict_verify_output(result, factsheet, check_verification_fields=True)
+
+            # Log final verification status
+            if verification.passed:
+                logger.info(f"[VERIFY] ✅ Shard {shard_id} passed verification" + (f" after {retry_count} retries" if retry_count > 0 else ""))
+            else:
+                logger.warning(f"[VERIFY] ⚠️ Shard {shard_id} failed after {retry_count} retries: {verification.errors[:2]}")
+
+            # Extract content (handles both formats)
+            adapted_content = extract_adapted_content(result)
+            entity_mappings = result.get("entity_mappings", {}) if isinstance(result, dict) else {}
             if not isinstance(entity_mappings, dict):
                 entity_mappings = {}
 
@@ -414,7 +662,7 @@ async def regenerate_shards_with_feedback(
         List of regenerated shards
     """
     if focus_shards:
-        target_shards = [s for s in shards if s.id in focus_shards]
+        target_shards = [s for s in shards if hasattr(s, 'id') and s.id in focus_shards]
     else:
         target_shards = shards
 
@@ -426,12 +674,15 @@ async def regenerate_shards_with_feedback(
 
     tasks = []
     for shard in target_shards:
+        shard_id = shard.id if hasattr(shard, 'id') else str(shard)
+        shard_name = shard.name if hasattr(shard, 'name') else shard_id
+        shard_content = shard.content if hasattr(shard, 'content') else shard
         task = regenerate_shard_with_feedback(
-            shard_id=shard.id,
-            shard_name=shard.name,
-            content=shard.content,
-            source_scenario=global_factsheet.get("source_scenario", ""),
-            target_scenario=global_factsheet.get("target_scenario", ""),
+            shard_id=shard_id,
+            shard_name=shard_name,
+            content=shard_content,
+            source_scenario=global_factsheet.get("source_scenario", "") if isinstance(global_factsheet, dict) else "",
+            target_scenario=global_factsheet.get("target_scenario", "") if isinstance(global_factsheet, dict) else "",
             global_factsheet=global_factsheet,
             feedback=feedback,
         )
@@ -441,8 +692,9 @@ async def regenerate_shards_with_feedback(
 
     for i, (shard, _) in enumerate(tasks):
         result = results[i]
+        shard_id = shard.id if hasattr(shard, 'id') else str(shard)
         if isinstance(result, Exception):
-            logger.error(f"Regeneration failed for {shard.id}: {result}")
+            logger.error(f"Regeneration failed for {shard_id}: {result}")
         else:
             adapted_content, entity_map = result
             shard.content = adapted_content
@@ -570,7 +822,7 @@ async def test_gemini_connection() -> bool:
     """Test if Gemini is properly configured."""
     try:
         result = await call_gemini('Return exactly: {"status": "ok"}')
-        return result.get("status") == "ok"
+        return isinstance(result, dict) and result.get("status") == "ok"
     except Exception as e:
         logger.error(f"Gemini connection test failed: {e}")
         return False

@@ -1,20 +1,24 @@
 """
 Stage 1: Adaptation Engine
 
-Parallel shard-based transformation using Gemini 2.5 Flash.
+Two modes available:
+1. SHARD-BASED: Parallel shard transformation (original approach)
+2. LEAF-BASED: Surgical leaf-level changes (new, faster approach)
 
 KEY IMPROVEMENTS:
-1. Global Factsheet extraction BEFORE parallel processing (consistency)
+1. Global Factsheet extraction BEFORE processing (consistency)
 2. Poison list to avoid source scenario terms
 3. Statistics tracking
 4. LangSmith tracing
+5. LEAF-BASED MODE: Index → Classify → Replace/Rewrite → Patch
 
-Flow:
+Flow (Leaf-Based):
 1. Extract Global Factsheet (one LLM call)
-2. Shard the JSON (13 shards)
-3. Filter to UNLOCKED shards only (8 shards)
-4. Adapt ALL unlocked shards IN PARALLEL (with shared factsheet)
-5. Merge back with locked shards
+2. Index all leaves in JSON
+3. Classify: SKIP / REPLACE / REWRITE
+4. Apply REPLACE instantly (no LLM)
+5. Batch REWRITE to LLM (grouped by semantic context)
+6. Apply patches (structure preserved)
 """
 import asyncio
 import copy
@@ -41,6 +45,83 @@ class AdaptationResult:
     total_time_ms: int
     rag_context: str = ""
     stats: dict = field(default_factory=dict)
+
+
+def extract_klos_from_json(input_json: dict) -> list[dict]:
+    """
+    Extract KLOs (Key Learning Outcomes) from the base JSON.
+
+    This is CRITICAL for content quality - each shard needs to know the actual
+    KLOs to align questions and resources properly.
+
+    Args:
+        input_json: The base simulation JSON
+
+    Returns:
+        List of KLO dicts with id, outcome, and criteria
+    """
+    # Safely handle non-dict inputs
+    input_json = input_json if isinstance(input_json, dict) else {}
+    topic_data = input_json.get("topicWizardData", {}) if isinstance(input_json.get("topicWizardData"), dict) else {}
+
+    # Try multiple locations where KLOs might be stored
+    assessment_criteria = topic_data.get("assessmentCriteria", {}) if isinstance(topic_data.get("assessmentCriteria"), dict) else {}
+    klo_sources = [
+        topic_data.get("assessmentCriterion", []) if isinstance(topic_data.get("assessmentCriterion"), list) else [],
+        assessment_criteria.get("klos", []) if isinstance(assessment_criteria.get("klos"), list) else [],
+        topic_data.get("selectedAssessmentCriterion", []) if isinstance(topic_data.get("selectedAssessmentCriterion"), list) else [],
+    ]
+
+    klos = []
+    for source in klo_sources:
+        if isinstance(source, list) and len(source) > 0:
+            for item in source:
+                if isinstance(item, dict):
+                    klo = {
+                        "id": item.get("id", ""),
+                        "outcome": item.get("keyLearningOutcome", item.get("title", item.get("content", ""))),
+                        "criteria": item.get("criterion", item.get("criteria", [])),
+                    }
+                    if klo["outcome"]:  # Only add if we have actual content
+                        klos.append(klo)
+            break  # Use first non-empty source
+
+    logger.info(f"Extracted {len(klos)} KLOs from input JSON")
+    return klos
+
+
+def format_klos_for_prompt(klos: list[dict]) -> str:
+    """
+    Format KLOs into a clear text format for injection into prompts.
+
+    Args:
+        klos: List of KLO dicts
+
+    Returns:
+        Formatted string for prompt injection
+    """
+    if not klos:
+        return ""
+
+    lines = ["## KEY LEARNING OUTCOMES (KLOs) - MUST ALIGN TO THESE:\n"]
+
+    for i, klo in enumerate(klos, 1):
+        lines.append(f"### KLO {i}: {klo.get('outcome', 'Unknown')[:200]}")
+
+        # Add criteria if available
+        criteria = klo.get("criteria", [])
+        if criteria and isinstance(criteria, list):
+            lines.append("**Criteria:**")
+            for j, c in enumerate(criteria[:5], 1):
+                if isinstance(c, dict):
+                    crit_text = c.get("criteria", c.get("text", ""))
+                else:
+                    crit_text = str(c)
+                if crit_text:
+                    lines.append(f"  {j}. {crit_text[:150]}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 class AdaptationEngine:
@@ -97,13 +178,18 @@ class AdaptationEngine:
         total_start = time.time()
 
         # 1. Determine source scenario (what the JSON currently represents)
-        topic_data = input_json.get("topicWizardData", {})
-        scenario_options_raw = topic_data.get("scenarioOptions", [])
+        # Safely handle non-dict inputs
+        input_json = input_json if isinstance(input_json, dict) else {}
+        topic_data = input_json.get("topicWizardData", {}) if isinstance(input_json.get("topicWizardData"), dict) else {}
+        scenario_options_raw = topic_data.get("scenarioOptions", []) if isinstance(topic_data.get("scenarioOptions"), list) else []
 
-        # Extract scenario texts (handle both formats)
+        # Extract scenario texts (handle both formats, including mixed lists)
         if scenario_options_raw:
             if isinstance(scenario_options_raw[0], dict):
-                scenario_options = [s.get("option", str(s)) for s in scenario_options_raw]
+                scenario_options = [
+                    s.get("option", str(s)) if isinstance(s, dict) else str(s)
+                    for s in scenario_options_raw
+                ]
             else:
                 scenario_options = scenario_options_raw
         else:
@@ -156,6 +242,15 @@ class AdaptationEngine:
             poison_list = global_factsheet.get('poison_list', [])
             poison_count = len(poison_list) if isinstance(poison_list, list) else 0
             logger.info(f"Factsheet: company={company_name}, poison_list={poison_count} terms")
+
+            # NOTE: KLOs come from factsheet LLM generation, NOT from input JSON
+            # The factsheet prompt generates KLOs appropriate for TARGET scenario
+            # Injecting SOURCE KLOs would cause the wrong learning outcomes to persist
+            klos = global_factsheet.get('klos', [])
+            if klos:
+                logger.info(f"Factsheet contains {len(klos)} LLM-generated KLOs for target scenario")
+            else:
+                logger.warning("No KLOs in factsheet - activities may not align properly")
         else:
             logger.warning(f"Unexpected factsheet type: {type(global_factsheet)}")
 
@@ -206,6 +301,35 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
         sharder = Sharder()
         collection = sharder.shard(input_json)
 
+        # 3b. ⭐ INDEX THE INPUT for RAG retrieval (populate collections BEFORE adaptation)
+        # This is the KEY step - the input IS our golden example!
+        print(f"[RAG] use_per_shard_rag = {self.use_per_shard_rag}")
+        if self.use_per_shard_rag:
+            from ..rag.retriever import SimulationRetriever
+            try:
+                print("[RAG] Indexing input for RAG retrieval...")
+                retriever = SimulationRetriever()
+                # Extract industry from factsheet for better retrieval
+                industry = "unknown"
+                if isinstance(global_factsheet, dict):
+                    company_info = global_factsheet.get("company", {})
+                    if isinstance(company_info, dict):
+                        industry = company_info.get("industry", "unknown")
+
+                print(f"[RAG] Industry: {industry}, Shards: {len(collection.shards)}")
+                index_result = retriever.index_simulation_by_shard_type(
+                    simulation_id="base_input",
+                    shards=collection.shards,
+                    industry=industry,
+                    clear_existing=True,  # Fresh index for each run
+                )
+                indexed_info = index_result.get('indexed_by_collection', {}) if isinstance(index_result, dict) else {}
+                print(f"[RAG] ✅ Indexed: {indexed_info}")
+                logger.info(f"Indexed input for RAG: {indexed_info}")
+            except Exception as e:
+                print(f"[RAG] ❌ Failed to index: {e}")
+                logger.warning(f"Failed to index input for RAG: {e}")
+
         # 4. Separate locked vs unlocked shards
         locked_shards = [s for s in collection.shards if s.lock_state == LockState.FULLY_LOCKED]
         unlocked_shards = [s for s in collection.shards if s.lock_state != LockState.FULLY_LOCKED]
@@ -254,8 +378,9 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
         adapted_json = post_process_content(adapted_json, global_factsheet)
 
         # 10. Update selectedScenarioOption with full scenario object
-        if "topicWizardData" in adapted_json:
-            scenario_options = adapted_json["topicWizardData"].get("scenarioOptions", [])
+        if "topicWizardData" in adapted_json and isinstance(adapted_json.get("topicWizardData"), dict):
+            topic_data_adapted = adapted_json["topicWizardData"]
+            scenario_options = topic_data_adapted.get("scenarioOptions", []) if isinstance(topic_data_adapted.get("scenarioOptions"), list) else []
             if target_scenario_index is not None and target_scenario_index < len(scenario_options):
                 # Set to the actual scenario option object
                 adapted_json["topicWizardData"]["selectedScenarioOption"] = scenario_options[target_scenario_index]
@@ -378,15 +503,30 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
         shard_rag_contexts = {}
         if self.use_per_shard_rag:
             shard_names = [s.id for s in shards]
-            target_scenario = context.get("target_scenario", "")
-            industry = context.get("global_factsheet", {}).get("industry", None)
+            # Safely handle non-dict context
+            context = context if isinstance(context, dict) else {}
+            target_scenario = context.get("target_scenario", "") if isinstance(context.get("target_scenario"), str) else ""
 
-            logger.info(f"Retrieving per-shard RAG examples for {len(shard_names)} shards...")
+            # Extract industry correctly (nested under company.industry)
+            industry = None
+            factsheet = context.get("global_factsheet", {}) if isinstance(context.get("global_factsheet"), dict) else {}
+            if isinstance(factsheet, dict):
+                company = factsheet.get("company", {})
+                if isinstance(company, dict):
+                    industry = company.get("industry")
+
+            print(f"[RAG] Retrieving examples for {len(shard_names)} shards (industry={industry})...")
+            logger.info(f"Retrieving per-shard RAG examples for {len(shard_names)} shards (industry={industry})...")
             shard_rag_contexts = await self._get_per_shard_rag_examples(
                 shard_names=shard_names,
                 target_scenario=target_scenario,
                 industry=industry,
             )
+
+            # Log what we retrieved
+            examples_found = sum(1 for v in shard_rag_contexts.values() if v)
+            print(f"[RAG] ✅ Retrieved: {examples_found}/{len(shard_names)} shards got examples")
+            logger.info(f"RAG retrieval: {examples_found}/{len(shard_names)} shards got examples")
 
             # Cache for potential reuse
             self._shard_examples_cache = shard_rag_contexts
@@ -586,3 +726,121 @@ async def adapt_simulation(
         use_per_shard_rag=use_per_shard_rag,
     )
     return await engine.adapt(input_json, target_scenario_index)
+
+
+# =============================================================================
+# LEAF-BASED ADAPTATION (NEW - FASTER APPROACH)
+# =============================================================================
+
+async def adapt_simulation_with_leaves(
+    input_json: dict,
+    target_scenario_index: int = None,
+    scenario_prompt: str = None,
+) -> AdaptationResult:
+    """
+    Adapt simulation using LEAF-BASED approach.
+
+    This is faster and more surgical than shard-based adaptation:
+    - Indexes all leaves in the JSON
+    - Classifies each leaf: SKIP / REPLACE / REWRITE
+    - Applies REPLACE instantly (no LLM)
+    - Batches REWRITE to LLM by semantic group
+    - Applies patches (structure 100% preserved)
+
+    Args:
+        input_json: Original simulation JSON
+        target_scenario_index: Index in scenarioOptions (Option A)
+        scenario_prompt: Free-form scenario text (Option B)
+
+    Returns:
+        AdaptationResult with adapted JSON
+    """
+    from ..core.leaf_adapter import LeafAdapter, get_adaptation_diff
+    from ..utils.gemini_client import extract_global_factsheet
+
+    total_start = time.time()
+
+    # 1. Determine source and target scenarios
+    topic_data = input_json.get("topicWizardData", {})
+    scenario_options_raw = topic_data.get("scenarioOptions", [])
+
+    # Extract scenario texts
+    if scenario_options_raw:
+        if isinstance(scenario_options_raw[0], dict):
+            scenario_options = [
+                s.get("option", str(s)) if isinstance(s, dict) else str(s)
+                for s in scenario_options_raw
+            ]
+        else:
+            scenario_options = scenario_options_raw
+    else:
+        scenario_options = []
+
+    # Get source scenario
+    selected = topic_data.get("selectedScenarioOption", 0)
+    if isinstance(selected, dict):
+        source_scenario = selected.get("option", "")
+    elif isinstance(selected, int) and scenario_options:
+        source_scenario = scenario_options[selected] if selected < len(scenario_options) else scenario_options[0]
+    elif scenario_options:
+        source_scenario = scenario_options[0]
+    else:
+        source_scenario = "Unknown source scenario"
+
+    # Get target scenario
+    if scenario_prompt:
+        target_scenario = scenario_prompt
+    elif target_scenario_index is not None:
+        if not scenario_options:
+            raise ValueError("No scenarioOptions in JSON. Use 'scenario_prompt' for free-form input.")
+        if target_scenario_index >= len(scenario_options):
+            raise ValueError(f"Invalid index {target_scenario_index}. Max: {len(scenario_options)-1}")
+        target_scenario = scenario_options[target_scenario_index]
+    else:
+        raise ValueError("Provide either 'scenario_prompt' or 'target_scenario_index'")
+
+    logger.info(f"LEAF-BASED Adaptation: {source_scenario[:50]}... → {target_scenario[:50]}...")
+
+    # 2. Extract global factsheet (1 LLM call)
+    logger.info("Extracting global factsheet...")
+    global_factsheet = await extract_global_factsheet(
+        source_scenario=source_scenario,
+        target_scenario=target_scenario,
+    )
+
+    # 3. Run leaf-based adaptation
+    logger.info("Running leaf-based adaptation...")
+    adapter = LeafAdapter(
+        factsheet=global_factsheet,
+        target_scenario=target_scenario,
+        source_scenario=source_scenario,
+    )
+    leaf_result = await adapter.adapt(input_json)
+
+    # 4. Log the diff
+    diff_text = get_adaptation_diff(leaf_result)
+    logger.info(f"\n{diff_text}")
+
+    total_time_ms = int((time.time() - total_start) * 1000)
+
+    # 5. Return result in AdaptationResult format
+    return AdaptationResult(
+        adapted_json=leaf_result.adapted_json,
+        entity_map={},
+        source_scenario=source_scenario,
+        target_scenario=target_scenario,
+        global_factsheet=global_factsheet,
+        shards_adapted=0,  # Not using shards
+        shards_locked=0,
+        parallel_time_ms=leaf_result.time_ms,
+        total_time_ms=total_time_ms,
+        rag_context="",
+        stats={
+            "mode": "leaf-based",
+            "total_leaves": leaf_result.total_leaves,
+            "pre_filtered": leaf_result.pre_filtered,
+            "llm_evaluated": leaf_result.llm_evaluated,
+            "changes_made": leaf_result.changes_made,
+            "kept_unchanged": leaf_result.kept_unchanged,
+        },
+    )

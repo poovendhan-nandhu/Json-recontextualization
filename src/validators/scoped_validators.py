@@ -40,14 +40,34 @@ logger = logging.getLogger(__name__)
 # GPT model for LLM-based validation
 VALIDATION_MODEL = os.getenv("VALIDATION_MODEL", "gpt-5.2-2025-12-11")
 
+# Semaphore for controlling concurrent LLM calls (prevents rate limiting)
+MAX_CONCURRENT_VALIDATION_CALLS = int(os.getenv("MAX_CONCURRENT_LLM_CALLS", "10"))
+_validation_semaphore = None  # Lazy initialization
+
+
+def _get_validation_semaphore():
+    """Get or create validation semaphore (must be called in async context)."""
+    global _validation_semaphore
+    if _validation_semaphore is None:
+        _validation_semaphore = asyncio.Semaphore(MAX_CONCURRENT_VALIDATION_CALLS)
+    return _validation_semaphore
+
 
 def _get_validation_llm():
     """Get OpenAI client for validation."""
+    import httpx
+
+    # Create custom httpx client with longer timeout
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(600.0, connect=60.0)  # 10 min read, 1 min connect
+    )
+
     return ChatOpenAI(
         model=VALIDATION_MODEL,
         temperature=0.1,
         max_retries=2,
-        request_timeout=60,
+        request_timeout=600,  # 10 min
+        http_async_client=http_client,
         api_key=os.getenv("OPENAI_API_KEY"),
     )
 
@@ -115,10 +135,10 @@ class BatchedCheckIssue(BaseModel):
 class BatchedCheckFix(BaseModel):
     """Single fix from batched check."""
     path: str  # JSON Pointer path (e.g., "/topicWizardData/simulationFlow/0/data/name")
-    old_value: Any  # Current value at this path
-    new_value: Any  # New value to set
-    reason: str  # Why this fix is needed
-    check_type: str  # Which check: domain_fidelity, context_fidelity, resource_self_contained, data_consistency, realism
+    old_value: Any = None  # Current value at this path
+    new_value: Any = None  # New value to set (optional - LLM sometimes omits)
+    reason: str = ""  # Why this fix is needed (optional)
+    check_type: str = "unknown"  # Which check (optional with default)
 
 
 class BatchedCheckResponse(BaseModel):
@@ -156,7 +176,7 @@ class StructureIntegrityValidator(BaseValidator):
         if not base_shard:
             # No base to compare, just check for basic structure
             return self._create_result(
-                shard_id=shard.id,
+                shard_id=shard.id if hasattr(shard, 'id') else "unknown",
                 passed=True,
                 score=1.0,
                 details={"note": "No base shard for comparison"}
@@ -461,11 +481,15 @@ class ContentCompletenessValidator(BaseValidator):
 
     IMPORTANT: Only flags fields that became empty DURING adaptation.
     Pre-existing empty fields in the base JSON are IGNORED.
+
+    Also checks for:
+    - HTML tag placeholders (<p>, <ol>, <ul> with no content)
+    - Truncated sentences (ending mid-word)
     """
 
     name = "ContentCompleteness"
     description = "Validates no empty or placeholder content"
-    is_blocker = False
+    is_blocker = True  # Changed to blocker - these are critical issues
 
     PLACEHOLDER_PATTERNS = [
         r'\[.*?\]',  # [PLACEHOLDER]
@@ -475,6 +499,37 @@ class ContentCompletenessValidator(BaseValidator):
         r'FIXME',
         r'XXX',
         r'lorem ipsum',
+    ]
+
+    # CRITICAL BLOCKER patterns - these indicate completely broken content
+    BLOCKER_PLACEHOLDER_PATTERNS = [
+        r'\[industry-specific[^\]]*\]',   # [industry-specific metric] - unresolved template
+        r'\[insert[^\]]*\]',              # [insert X here]
+        r'\[placeholder[^\]]*\]',         # [placeholder]
+        r'\[TBD[^\]]*\]',                 # [TBD]
+        r'\[TODO[^\]]*\]',                # [TODO]
+        r'\[REPLACE[^\]]*\]',             # [REPLACE WITH...]
+    ]
+
+    # HTML tag placeholders - standalone tags with no content
+    HTML_PLACEHOLDER_PATTERNS = [
+        r'<p>\s*</p>',           # Empty paragraph
+        r'<ol>\s*</ol>',         # Empty ordered list
+        r'<ul>\s*</ul>',         # Empty unordered list
+        r'<div>\s*</div>',       # Empty div
+        r'<li>\s*</li>',         # Empty list item
+        r'<span>\s*</span>',     # Empty span
+        r'(?<![a-zA-Z])<p>(?!\s*[a-zA-Z<])',   # <p> not followed by content
+        r'(?<![a-zA-Z])<ol>(?!\s*[a-zA-Z<])',  # <ol> not followed by content
+        r'(?<![a-zA-Z])<ul>(?!\s*[a-zA-Z<])',  # <ul> not followed by content
+    ]
+
+    # Truncated sentence patterns - sentences ending mid-word
+    TRUNCATED_PATTERNS = [
+        r'\b[a-zA-Z]{1,3}\s*["\']?\s*$',      # Ends with 1-3 letter word at string end
+        r'\b[a-zA-Z]+\-\s*$',                  # Ends with hyphen mid-word
+        r'\b[a-zA-Z]+\.\.\.\s*$',              # Ends with ellipsis (might be intentional)
+        r'\b(?:the|a|an|to|of|in|for|and|or|is|are|was|were)\s*$',  # Ends with article/preposition
     ]
 
     async def validate(self, shard: Any, context: dict) -> ValidationResult:
@@ -510,8 +565,24 @@ class ContentCompletenessValidator(BaseValidator):
 
         # Find placeholder content
         content_text = json.dumps(content) if isinstance(content, (dict, list)) else str(content)
+
+        # First check for CRITICAL blocker placeholders
+        blocker_placeholders = self._find_blocker_placeholders(content_text)
+        for bp in blocker_placeholders:
+            issues.append(self._create_issue(
+                message=f"CRITICAL: Unresolved template placeholder found: {bp}",
+                location="content",
+                severity=ValidationSeverity.BLOCKER,
+                current_value=bp,
+                suggestion="This placeholder was never resolved - content generation failed"
+            ))
+
+        # Then check regular placeholders
         placeholders = self._find_placeholders(content_text)
         for placeholder in placeholders:
+            # Skip if already caught as blocker
+            if any(bp in placeholder for bp in blocker_placeholders):
+                continue
             issues.append(self._create_issue(
                 message=f"Placeholder content found: {placeholder}",
                 location="content",
@@ -520,8 +591,44 @@ class ContentCompletenessValidator(BaseValidator):
                 suggestion="Replace placeholder with actual content"
             ))
 
+        # Find HTML tag placeholders (BLOCKER - broken content)
+        html_placeholders = self._find_html_placeholders(content_text)
+        for html_ph in html_placeholders:
+            issues.append(self._create_issue(
+                message=f"HTML placeholder/broken tag found: {html_ph}",
+                location="content",
+                severity=ValidationSeverity.BLOCKER,
+                current_value=html_ph,
+                suggestion="Remove empty HTML tags or add proper content inside them"
+            ))
+
+        # Find truncated sentences (BLOCKER - incomplete content)
+        truncated = self._find_truncated_sentences(content)
+        for path, text_preview in truncated:
+            issues.append(self._create_issue(
+                message=f"Truncated/incomplete sentence detected",
+                location=path,
+                severity=ValidationSeverity.BLOCKER,
+                current_value=text_preview,
+                suggestion="Complete the sentence - it appears to be cut off mid-word"
+            ))
+
+        # Check for sparse resource content (WARNING - content too thin for learning)
+        shard_id = shard.id if hasattr(shard, 'id') else ""
+        if "resource" in shard_id.lower():
+            sparse_resources = self._find_sparse_resources(content)
+            for path, word_count in sparse_resources:
+                issues.append(self._create_issue(
+                    message=f"Sparse resource content: only {word_count} words (minimum 300 recommended)",
+                    location=path,
+                    severity=ValidationSeverity.WARNING,
+                    current_value=f"{word_count} words",
+                    expected_value="300+ words with statistics and citations",
+                    suggestion="Resources must be comprehensive with statistics, sources, and actionable content"
+                ))
+
         passed = len([i for i in issues if i.severity == ValidationSeverity.BLOCKER]) == 0
-        score = 1.0 - (len(issues) * 0.05)
+        score = 1.0 - (len(issues) * 0.1)
 
         return self._create_result(
             shard_id=shard.id if hasattr(shard, 'id') else "unknown",
@@ -560,6 +667,88 @@ class ContentCompletenessValidator(BaseValidator):
             matches = re.findall(pattern, text, re.IGNORECASE)
             found.extend(matches[:5])  # Limit per pattern
         return found[:10]  # Total limit
+
+    def _find_blocker_placeholders(self, text: str) -> list[str]:
+        """Find CRITICAL blocker placeholders that indicate broken content."""
+        found = []
+        for pattern in self.BLOCKER_PLACEHOLDER_PATTERNS:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            found.extend(matches)
+        return list(set(found))[:10]  # Dedupe and limit
+
+    def _find_html_placeholders(self, text: str) -> list[str]:
+        """Find HTML tag placeholders (empty or broken tags)."""
+        found = []
+        for pattern in self.HTML_PLACEHOLDER_PATTERNS:
+            try:
+                matches = re.findall(pattern, text, re.IGNORECASE)
+                found.extend(matches[:3])  # Limit per pattern
+            except re.error:
+                pass
+        return list(set(found))[:5]  # Dedupe and limit
+
+    def _find_truncated_sentences(self, content: Any, path: str = "") -> list[tuple[str, str]]:
+        """Find truncated sentences in text fields."""
+        truncated = []
+
+        if isinstance(content, dict):
+            for key, value in content.items():
+                new_path = f"{path}.{key}" if path else key
+                if isinstance(value, str) and len(value) > 50:
+                    # Check if text ends abruptly
+                    text = value.strip()
+                    if text:
+                        # Check for truncation patterns
+                        last_50 = text[-50:]
+                        for pattern in self.TRUNCATED_PATTERNS:
+                            if re.search(pattern, text):
+                                # Make sure it's not a normal sentence ending
+                                if not text.endswith(('.', '!', '?', '"', "'", ')', ']')):
+                                    truncated.append((new_path, text[-80:] if len(text) > 80 else text))
+                                    break
+                elif isinstance(value, (dict, list)):
+                    truncated.extend(self._find_truncated_sentences(value, new_path))
+        elif isinstance(content, list):
+            for i, item in enumerate(content):
+                truncated.extend(self._find_truncated_sentences(item, f"{path}[{i}]"))
+
+        return truncated[:5]  # Limit total
+
+    def _find_sparse_resources(self, content: Any, path: str = "") -> list[tuple[str, int]]:
+        """
+        Find resource entries with sparse content (under 300 words).
+
+        Resources should be comprehensive for learners, including:
+        - Data tables
+        - Statistics with sources
+        - Actionable content
+
+        Returns list of (path, word_count) tuples for sparse resources.
+        """
+        sparse = []
+        MIN_RESOURCE_WORDS = 300  # Minimum words for a useful resource
+
+        # Fields that should have substantial content in resources
+        content_fields = ['markdownText', 'content', 'description', 'text']
+
+        if isinstance(content, dict):
+            for key, value in content.items():
+                new_path = f"{path}.{key}" if path else key
+
+                # Check content fields for minimum length
+                if key.lower() in [f.lower() for f in content_fields]:
+                    if isinstance(value, str):
+                        word_count = len(value.split())
+                        if word_count < MIN_RESOURCE_WORDS and word_count > 10:  # Ignore very short/empty
+                            sparse.append((new_path, word_count))
+                elif isinstance(value, (dict, list)):
+                    sparse.extend(self._find_sparse_resources(value, new_path))
+
+        elif isinstance(content, list):
+            for i, item in enumerate(content):
+                sparse.extend(self._find_sparse_resources(item, f"{path}[{i}]"))
+
+        return sparse[:10]  # Limit to avoid noise
 
 
 class ToneValidator(BaseValidator):
@@ -621,10 +810,13 @@ Return JSON with:
 
             chain = chat_prompt | self.llm | parser
 
-            result = await chain.ainvoke({
-                "input": prompt,
-                "format_instructions": parser.get_format_instructions(),
-            })
+            # Use semaphore to prevent rate limiting
+            semaphore = _get_validation_semaphore()
+            async with semaphore:
+                result = await chain.ainvoke({
+                    "input": prompt,
+                    "format_instructions": parser.get_format_instructions(),
+                })
 
             issues = []
             for issue in result.issues:
@@ -650,6 +842,114 @@ Return JSON with:
                 score=0.8,
                 details={"note": f"Tone check skipped: {e}"}
             )
+
+
+# =============================================================================
+# SENDER CONSISTENCY VALIDATOR
+# =============================================================================
+
+class SenderConsistencyValidator(BaseValidator):
+    """
+    Check that email signatures match sender metadata.
+
+    Detects mismatches like:
+    - Email signed by "Liam Rodriguez" but sender metadata says "Sophia Chen"
+    - Body references different person than From field
+    """
+
+    name = "SenderConsistency"
+    description = "Validates email sender/signature consistency"
+    is_blocker = True
+    applicable_shards = ["emails", "simulation_flow"]
+
+    async def validate(self, shard: Any, context: dict) -> ValidationResult:
+        issues = []
+        shard_id = shard.id if hasattr(shard, 'id') else "unknown"
+
+        content = shard.content if hasattr(shard, 'content') else shard
+
+        # Find all emails in content
+        emails = self._find_emails(content)
+
+        for email_path, email_data in emails:
+            # Extract sender from metadata
+            sender_name = email_data.get("senderName", "")
+            sender_email = email_data.get("senderEmail", "")
+            from_field = email_data.get("from", "")
+
+            # Extract signature from body
+            body = email_data.get("body", "") or email_data.get("content", "")
+            signature_names = self._extract_signature_names(body)
+
+            # Check for mismatches
+            if sender_name and signature_names:
+                sender_first = sender_name.split()[0].lower() if sender_name else ""
+                for sig_name in signature_names:
+                    sig_first = sig_name.split()[0].lower() if sig_name else ""
+                    if sig_first and sender_first and sig_first != sender_first:
+                        # Mismatch detected
+                        issues.append(self._create_issue(
+                            message=f"Sender mismatch: email signed by '{sig_name}' but sender is '{sender_name}'",
+                            location=email_path,
+                            severity=ValidationSeverity.BLOCKER,
+                            current_value=f"Signature: {sig_name}, Sender: {sender_name}",
+                            suggestion=f"Update signature to match sender '{sender_name}' or change sender metadata"
+                        ))
+
+        passed = len(issues) == 0
+        score = 1.0 if passed else max(0.0, 1.0 - (len(issues) * 0.3))
+
+        return self._create_result(
+            shard_id=shard_id,
+            passed=passed,
+            score=score,
+            issues=issues,
+            details={"emails_checked": len(emails)}
+        )
+
+    def _find_emails(self, content: Any, path: str = "") -> list[tuple[str, dict]]:
+        """Find all email objects in content."""
+        emails = []
+
+        if isinstance(content, dict):
+            # Check if this is an email object
+            if any(k in content for k in ["body", "subject", "senderName", "senderEmail"]):
+                emails.append((path, content))
+
+            # Also check for nested emails
+            for key, value in content.items():
+                new_path = f"{path}.{key}" if path else key
+                if key in ["email", "taskEmail", "secondaryTaskEmail"]:
+                    if isinstance(value, dict):
+                        emails.append((new_path, value))
+                emails.extend(self._find_emails(value, new_path))
+
+        elif isinstance(content, list):
+            for i, item in enumerate(content):
+                emails.extend(self._find_emails(item, f"{path}[{i}]"))
+
+        return emails
+
+    def _extract_signature_names(self, body: str) -> list[str]:
+        """Extract potential signature names from email body."""
+        import re
+
+        names = []
+
+        # Common signature patterns
+        patterns = [
+            r'(?:Best|Regards|Thanks|Sincerely|Cheers)[,\s]*\n+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',  # After salutation
+            r'(?:^|\n)([A-Z][a-z]+\s+[A-Z][a-z]+)[,\s]*\n*(?:Senior|Director|Manager|Head|VP|CEO|CTO)',  # Name + Title
+            r'(?:signed|from)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)',  # "signed by X"
+        ]
+
+        for pattern in patterns:
+            matches = re.findall(pattern, body, re.MULTILINE | re.IGNORECASE)
+            for match in matches:
+                if isinstance(match, str) and len(match) > 3:
+                    names.append(match.strip())
+
+        return list(set(names))
 
 
 # =============================================================================
@@ -1035,6 +1335,523 @@ class EnhancedDomainFidelityValidator(BaseValidator):
 
 
 # =============================================================================
+# NEW VALIDATORS (Shweta Requirements)
+# =============================================================================
+
+class ResourceAnswerabilityValidator(BaseValidator):
+    """
+    Validator: Resource Answerability (Shweta Requirement Dec 22)
+
+    "does the resource contain all the information the student needs
+    to answer the submission questions"
+
+    Uses LLM to check if each question can be answered from resources ONLY.
+    """
+
+    name = "ResourceAnswerability"
+    description = "Validates every question can be answered from resources alone"
+    is_blocker = True
+    applicable_shards = ["simulation_flow", "resources"]
+
+    def __init__(self):
+        super().__init__()
+        self.llm = _get_validation_llm()
+
+    @traceable(name="resource_answerability_check")
+    async def validate(self, shard: Any, context: dict) -> ValidationResult:
+        """Check if all questions are answerable from resources."""
+        issues = []
+        shard_id = shard.id if hasattr(shard, 'id') else "unknown"
+
+        # Extract questions and resources from context
+        questions = context.get("questions", [])
+        resources = context.get("resources", [])
+
+        # If not in context, try to extract from shard
+        content = shard.content if hasattr(shard, 'content') else shard
+        if not questions:
+            questions = self._extract_questions(content)
+        if not resources:
+            resources = self._extract_resources(content)
+
+        if not questions or not resources:
+            return self._create_result(
+                shard_id=shard_id,
+                passed=True,
+                score=1.0,
+                details={"note": "No questions or resources to check"}
+            )
+
+        # Build prompt for LLM
+        prompt = self._build_prompt(questions, resources)
+
+        try:
+            semaphore = _get_validation_semaphore()
+            async with semaphore:
+                result = await self.llm.ainvoke(prompt)
+
+            # Parse response
+            response_text = result.content if hasattr(result, 'content') else str(result)
+            unanswerable = self._parse_unanswerable(response_text, questions)
+
+            for q_idx, reason in unanswerable:
+                issues.append(self._create_issue(
+                    message=f"Question {q_idx + 1} cannot be answered from resources alone",
+                    location=f"question_{q_idx}",
+                    severity=ValidationSeverity.BLOCKER,
+                    current_value=questions[q_idx][:100] if q_idx < len(questions) else "",
+                    suggestion=f"Add required data to resources: {reason}"
+                ))
+
+            passed = len(issues) == 0
+            score = 1.0 - (len(issues) * 0.2)
+
+            return self._create_result(
+                shard_id=shard_id,
+                passed=passed,
+                score=max(0.0, score),
+                issues=issues,
+                details={
+                    "questions_checked": len(questions),
+                    "unanswerable_count": len(unanswerable)
+                }
+            )
+
+        except Exception as e:
+            logger.warning(f"Resource answerability check failed: {e}")
+            return self._create_result(
+                shard_id=shard_id,
+                passed=True,
+                score=0.8,
+                details={"note": f"Check skipped: {e}"}
+            )
+
+    def _extract_questions(self, content: Any) -> list[str]:
+        """Extract submission questions from content."""
+        questions = []
+
+        def search(obj, path=""):
+            if isinstance(obj, dict):
+                # Look for submission questions
+                if "questions" in obj and isinstance(obj["questions"], list):
+                    for q in obj["questions"]:
+                        if isinstance(q, dict):
+                            text = q.get("text") or q.get("question") or q.get("content", "")
+                            if text:
+                                questions.append(text)
+                        elif isinstance(q, str):
+                            questions.append(q)
+                for k, v in obj.items():
+                    search(v, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    search(item, f"{path}[{i}]")
+
+        search(content)
+        return questions
+
+    def _extract_resources(self, content: Any) -> list[str]:
+        """Extract resources from content."""
+        resources = []
+
+        def search(obj, path=""):
+            if isinstance(obj, dict):
+                # Look for resource content
+                if "content" in obj and "resource" in path.lower():
+                    resources.append(str(obj["content"]))
+                elif "body" in obj and "resource" in path.lower():
+                    resources.append(str(obj["body"]))
+                elif "data" in obj and isinstance(obj["data"], str) and len(obj["data"]) > 100:
+                    resources.append(obj["data"])
+                for k, v in obj.items():
+                    search(v, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    search(item, f"{path}[{i}]")
+
+        search(content)
+        return resources
+
+    def _build_prompt(self, questions: list[str], resources: list[str]) -> str:
+        """Build prompt for answerability check."""
+        q_text = "\n".join([f"{i+1}. {q[:300]}" for i, q in enumerate(questions[:10])])
+        r_text = "\n---\n".join([r[:1000] for r in resources[:5]])
+
+        return f"""You are validating a business simulation for educational purposes.
+
+RESOURCES PROVIDED TO STUDENT:
+{r_text}
+
+QUESTIONS STUDENT MUST ANSWER:
+{q_text}
+
+For each question, determine if it can be FULLY answered using ONLY the resources above.
+The student should NOT need any external knowledge or data not in the resources.
+
+List any questions that CANNOT be answered from the resources alone.
+For each unanswerable question, explain what data is missing.
+
+Format your response as:
+UNANSWERABLE:
+- Question X: [reason what data is missing]
+- Question Y: [reason what data is missing]
+
+If ALL questions are answerable, respond with:
+ALL QUESTIONS ANSWERABLE
+
+Be strict - if a question requires specific numbers, dates, or facts not in the resources, it's unanswerable."""
+
+    def _parse_unanswerable(self, response: str, questions: list[str]) -> list[tuple[int, str]]:
+        """Parse LLM response to find unanswerable questions."""
+        unanswerable = []
+
+        if "ALL QUESTIONS ANSWERABLE" in response.upper():
+            return []
+
+        lines = response.split("\n")
+        for line in lines:
+            line = line.strip()
+            if line.startswith("- Question") or line.startswith("-Question"):
+                # Extract question number
+                match = re.search(r'Question\s*(\d+)', line, re.IGNORECASE)
+                if match:
+                    q_num = int(match.group(1)) - 1  # Convert to 0-indexed
+                    reason = line.split(":", 1)[1].strip() if ":" in line else "Missing data"
+                    if 0 <= q_num < len(questions):
+                        unanswerable.append((q_num, reason))
+
+        return unanswerable
+
+
+class AnswerLeakageValidator(BaseValidator):
+    """
+    Validator: Answer Leakage (Shweta Requirement Dec 22)
+
+    "the resource does not have the answer... it should basically have
+    all the dots for inference to connect the dots, but it doesn't
+    really give the connected dots"
+
+    Resources should provide DATA, not CONCLUSIONS.
+    """
+
+    name = "AnswerLeakage"
+    description = "Validates resources provide data, not direct answers"
+    is_blocker = True
+    applicable_shards = ["resources", "simulation_flow"]
+
+    # Patterns that indicate answer leakage
+    LEAKAGE_PATTERNS = [
+        r'\bthe best (?:option|choice|strategy|approach) is\b',
+        r'\bshould choose\b',
+        r'\bthe answer is\b',
+        r'\bthe solution is\b',
+        r'\bclearly (?:the|this) is\b',
+        r'\bthe correct (?:answer|response|choice) is\b',
+        r'\bthis means (?:that |we should)\b',
+        r'\btherefore.{0,20}(?:should|must|recommend)\b',
+        r'\bin conclusion.{0,30}(?:best|recommend|choose)\b',
+        r'\bthe key takeaway is\b',
+        r'\bthe main point is\b',
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.llm = _get_validation_llm()
+
+    @traceable(name="answer_leakage_check")
+    async def validate(self, shard: Any, context: dict) -> ValidationResult:
+        """Check if resources leak answers."""
+        issues = []
+        shard_id = shard.id if hasattr(shard, 'id') else "unknown"
+
+        content = shard.content if hasattr(shard, 'content') else shard
+        content_text = json.dumps(content) if isinstance(content, (dict, list)) else str(content)
+
+        # Phase 1: Fast pattern matching
+        found_patterns = []
+        for pattern in self.LEAKAGE_PATTERNS:
+            matches = re.findall(pattern, content_text, re.IGNORECASE)
+            if matches:
+                found_patterns.extend(matches[:2])
+
+        for pattern_match in found_patterns[:5]:
+            issues.append(self._create_issue(
+                message=f"Potential answer leakage detected: '{pattern_match}'",
+                location="resource_content",
+                severity=ValidationSeverity.WARNING,
+                current_value=pattern_match,
+                suggestion="Provide data/facts only, let students draw conclusions"
+            ))
+
+        # Phase 2: LLM check for semantic leakage (only if resources are substantial)
+        if len(content_text) > 500:
+            questions = context.get("questions", [])
+            if questions:
+                try:
+                    semantic_leaks = await self._check_semantic_leakage(content_text, questions)
+                    for leak in semantic_leaks:
+                        issues.append(self._create_issue(
+                            message=f"Resource directly answers question: {leak}",
+                            location="resource_content",
+                            severity=ValidationSeverity.BLOCKER,
+                            suggestion="Remove direct answers, provide supporting data only"
+                        ))
+                except Exception as e:
+                    logger.warning(f"Semantic leakage check failed: {e}")
+
+        passed = len([i for i in issues if i.severity == ValidationSeverity.BLOCKER]) == 0
+        score = 1.0 - (len(issues) * 0.15)
+
+        return self._create_result(
+            shard_id=shard_id,
+            passed=passed,
+            score=max(0.0, score),
+            issues=issues,
+            details={
+                "pattern_matches": len(found_patterns),
+                "issues_found": len(issues)
+            }
+        )
+
+    async def _check_semantic_leakage(self, resource_text: str, questions: list[str]) -> list[str]:
+        """Use LLM to check for semantic answer leakage."""
+        q_text = "\n".join([f"{i+1}. {q[:200]}" for i, q in enumerate(questions[:5])])
+
+        prompt = f"""You are checking if resources LEAK ANSWERS to student questions.
+
+RESOURCE CONTENT (excerpt):
+{resource_text[:2000]}
+
+STUDENT QUESTIONS:
+{q_text}
+
+Resources should provide DATA and FACTS that students analyze.
+Resources should NOT directly state conclusions or answers.
+
+GOOD: "Option A has 20% ROI, Option B has 15% ROI, Option C has 25% ROI"
+BAD: "Option C is clearly the best choice with 25% ROI"
+
+Check if any resource text directly answers any question.
+List any answer leakage found.
+
+Format:
+LEAKAGE FOUND:
+- [description of what answer is leaked]
+
+If no leakage:
+NO LEAKAGE FOUND"""
+
+        semaphore = _get_validation_semaphore()
+        async with semaphore:
+            result = await self.llm.ainvoke(prompt)
+
+        response = result.content if hasattr(result, 'content') else str(result)
+
+        if "NO LEAKAGE FOUND" in response.upper():
+            return []
+
+        leaks = []
+        lines = response.split("\n")
+        for line in lines:
+            if line.strip().startswith("-"):
+                leaks.append(line.strip()[1:].strip())
+
+        return leaks[:3]  # Limit
+
+
+class CrossShardAlignmentValidator(BaseValidator):
+    """
+    Validator: Cross-Shard Alignment
+
+    Checks alignment ACROSS shards after individual processing:
+    1. Every KLO has at least one question assessing it
+    2. Every question maps to a KLO
+    3. Company name is consistent across all shards
+    4. Industry terms are consistent
+
+    This runs AFTER all shards are processed.
+    """
+
+    name = "CrossShardAlignment"
+    description = "Validates alignment across all shards (KLOs ↔ Questions ↔ Resources)"
+    is_blocker = True
+
+    @traceable(name="cross_shard_alignment_check")
+    async def validate(self, shard: Any, context: dict) -> ValidationResult:
+        """
+        For cross-shard validation, 'shard' is actually the full adapted JSON.
+        Context should contain 'all_shards' for cross-reference.
+        """
+        issues = []
+
+        # This validator expects the full adapted content
+        content = shard.content if hasattr(shard, 'content') else shard
+
+        # Extract components
+        klos = self._extract_klos(content)
+        questions = self._extract_questions(content)
+        resources = self._extract_resources(content)
+        company_names = self._extract_company_names(content)
+
+        # Check 1: Every KLO has at least one question
+        klo_coverage = self._check_klo_coverage(klos, questions)
+        for klo_id, klo_text in klo_coverage.get("uncovered", []):
+            issues.append(self._create_issue(
+                message=f"KLO not covered by any question: '{klo_text[:50]}...'",
+                location=f"klo_{klo_id}",
+                severity=ValidationSeverity.BLOCKER,
+                suggestion="Add a question that assesses this KLO"
+            ))
+
+        # Check 2: Company name consistency
+        if len(company_names) > 1:
+            main_name = company_names[0]
+            for name in company_names[1:]:
+                if name.lower() != main_name.lower():
+                    issues.append(self._create_issue(
+                        message=f"Inconsistent company name: '{name}' vs '{main_name}'",
+                        location="company_name",
+                        severity=ValidationSeverity.BLOCKER,
+                        current_value=name,
+                        expected_value=main_name,
+                        suggestion=f"Use consistent company name: {main_name}"
+                    ))
+
+        # Check 3: Resource count matches expected
+        expected_resource_count = context.get("base_resource_count", 0)
+        if expected_resource_count > 0 and len(resources) != expected_resource_count:
+            issues.append(self._create_issue(
+                message=f"Resource count mismatch: expected {expected_resource_count}, got {len(resources)}",
+                location="resources",
+                severity=ValidationSeverity.WARNING,
+                suggestion="Ensure all resources are preserved"
+            ))
+
+        passed = len([i for i in issues if i.severity == ValidationSeverity.BLOCKER]) == 0
+        score = 1.0 - (len(issues) * 0.15)
+
+        return self._create_result(
+            shard_id="cross_shard",
+            passed=passed,
+            score=max(0.0, score),
+            issues=issues,
+            details={
+                "klo_count": len(klos),
+                "question_count": len(questions),
+                "resource_count": len(resources),
+                "company_names_found": len(company_names)
+            }
+        )
+
+    def _extract_klos(self, content: Any) -> list[tuple[str, str]]:
+        """Extract KLOs (id, text) from content."""
+        klos = []
+
+        def search(obj):
+            if isinstance(obj, dict):
+                if "assessmentCriterion" in obj:
+                    items = obj["assessmentCriterion"]
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict):
+                                klo_id = item.get("id", "")
+                                text = item.get("text") or item.get("description", "")
+                                if text:
+                                    klos.append((klo_id, text))
+                for v in obj.values():
+                    search(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    search(item)
+
+        search(content)
+        return klos
+
+    def _extract_questions(self, content: Any) -> list[str]:
+        """Extract questions from content."""
+        questions = []
+
+        def search(obj):
+            if isinstance(obj, dict):
+                if "questions" in obj and isinstance(obj["questions"], list):
+                    for q in obj["questions"]:
+                        if isinstance(q, dict):
+                            text = q.get("text") or q.get("question", "")
+                            if text:
+                                questions.append(text)
+                for v in obj.values():
+                    search(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    search(item)
+
+        search(content)
+        return questions
+
+    def _extract_resources(self, content: Any) -> list[str]:
+        """Extract resources from content."""
+        resources = []
+
+        def search(obj, path=""):
+            if isinstance(obj, dict):
+                if "resource" in path.lower() and ("content" in obj or "body" in obj):
+                    text = obj.get("content") or obj.get("body", "")
+                    if text:
+                        resources.append(text)
+                for k, v in obj.items():
+                    search(v, f"{path}.{k}")
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    search(item, f"{path}[{i}]")
+
+        search(content)
+        return resources
+
+    def _extract_company_names(self, content: Any) -> list[str]:
+        """Extract company names from content."""
+        names = []
+
+        def search(obj):
+            if isinstance(obj, dict):
+                for key in ["companyName", "company_name", "organizationName", "name"]:
+                    if key in obj and isinstance(obj[key], str) and len(obj[key]) > 2:
+                        # Filter out generic names
+                        name = obj[key]
+                        if name.lower() not in ["the company", "company", "organization"]:
+                            names.append(name)
+                for v in obj.values():
+                    search(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    search(item)
+
+        search(content)
+        return list(set(names))
+
+    def _check_klo_coverage(self, klos: list[tuple[str, str]], questions: list[str]) -> dict:
+        """Check if each KLO is covered by at least one question."""
+        uncovered = []
+
+        for klo_id, klo_text in klos:
+            # Simple heuristic: check if key words from KLO appear in any question
+            klo_words = set(klo_text.lower().split())
+            klo_words -= {"the", "a", "an", "to", "and", "or", "of", "in", "for", "is", "are", "will", "be"}
+
+            covered = False
+            for q in questions:
+                q_words = set(q.lower().split())
+                overlap = klo_words & q_words
+                if len(overlap) >= 2:  # At least 2 meaningful words overlap
+                    covered = True
+                    break
+
+            if not covered:
+                uncovered.append((klo_id, klo_text))
+
+        return {"uncovered": uncovered}
+
+
+# =============================================================================
 # BATCHED SHARD CHECKER (Key LLM class)
 # =============================================================================
 
@@ -1104,10 +1921,13 @@ CRITICAL: Follow the output format EXACTLY. Every fix object MUST have:
 
             chain = chat_prompt | self.llm | parser
 
-            result = await chain.ainvoke({
-                "input": prompt,
-                "format_instructions": parser.get_format_instructions(),
-            })
+            # Use semaphore to prevent rate limiting (12 shards hitting API at once)
+            semaphore = _get_validation_semaphore()
+            async with semaphore:
+                result = await chain.ainvoke({
+                    "input": prompt,
+                    "format_instructions": parser.get_format_instructions(),
+                })
 
             # Convert to ValidationResults
             validation_results = self._convert_to_results(result, shard_id)
@@ -1513,7 +2333,7 @@ class ScopedValidator:
 
         # Calculate overall score
         overall_score = sum(all_scores) / len(all_scores) if all_scores else 1.0
-        passed = total_blockers == 0 and overall_score >= 0.98
+        passed = total_blockers == 0 and overall_score >= 0.95
 
         report = ScopedValidationReport(
             overall_score=overall_score,

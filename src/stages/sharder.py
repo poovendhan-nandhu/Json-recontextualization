@@ -278,6 +278,92 @@ def _merge_wildcard_content(data: dict, path: str, values: list[dict]) -> dict:
     return data
 
 
+def cleanup_merged_json(data: dict) -> dict:
+    """
+    Post-processing cleanup for merged JSON.
+
+    Fixes:
+    - Trailing dots in simulationImage, simulationName
+    - Trailing dots in flowProperties.type
+    - Truncated URLs (avatarF2. → avatarF2.webp)
+    - Placeholder text removal
+    - Inconsistent template braces (normalizes to {{{var}}})
+
+    Args:
+        data: Merged JSON
+
+    Returns:
+        Cleaned JSON
+    """
+    import re
+    from ..utils.content_fixer import fix_truncated_urls, remove_placeholders
+
+    result = copy.deepcopy(data)
+    tw = result.get("topicWizardData", {})
+
+    # === CRITICAL: Fix truncated URLs BEFORE any other processing ===
+    # This catches avatar URLs ending with . and fixes them to .webp
+    url_fixes = fix_truncated_urls(tw)
+    if url_fixes:
+        logger.info(f"Fixed {len(url_fixes)} truncated URLs: {url_fixes[:3]}")
+
+    # === Fix placeholders ===
+    placeholder_fixes = remove_placeholders(tw)
+    if placeholder_fixes:
+        logger.info(f"Fixed {len(placeholder_fixes)} placeholders: {placeholder_fixes[:3]}")
+
+    # Fix trailing dots in specific fields
+    if tw.get("simulationImage", "").endswith("."):
+        tw["simulationImage"] = tw["simulationImage"].rstrip(".")
+        logger.debug("Removed trailing dot from simulationImage")
+
+    if tw.get("simulationName", "").endswith("."):
+        tw["simulationName"] = tw["simulationName"].rstrip(".")
+        logger.debug("Removed trailing dot from simulationName")
+
+    # Fix flowProperties.type trailing dots
+    def fix_flow_properties(obj):
+        if isinstance(obj, dict):
+            if "flowProperties" in obj and isinstance(obj["flowProperties"], dict):
+                fp_type = obj["flowProperties"].get("type", "")
+                if fp_type.endswith("."):
+                    obj["flowProperties"]["type"] = fp_type.rstrip(".")
+            for v in obj.values():
+                fix_flow_properties(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                fix_flow_properties(item)
+
+    fix_flow_properties(tw)
+
+    # Normalize template braces: {{var}} -> {{{var}}}
+    def normalize_braces(text: str) -> str:
+        # Convert {{var}} to {{{var}}} for consistency
+        # But don't touch already triple-braced
+        pattern = r'\{\{([a-zA-Z]+)\}\}(?!\})'
+        return re.sub(pattern, r'{{{\1}}}', text)
+
+    def fix_braces_in_obj(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, str):
+                    obj[k] = normalize_braces(v)
+                else:
+                    fix_braces_in_obj(v)
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                if isinstance(item, str):
+                    obj[i] = normalize_braces(item)
+                else:
+                    fix_braces_in_obj(item)
+
+    fix_braces_in_obj(tw)
+
+    result["topicWizardData"] = tw
+    logger.info("Post-processing cleanup complete")
+    return result
+
+
 def shard_json(data: dict, scenario_prompt: str = "") -> ShardCollection:
     """
     Convenience function to shard a JSON.

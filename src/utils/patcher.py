@@ -227,9 +227,17 @@ class JSONPatcher:
 
         Stores old value for rollback.
         """
+        # Skip invalid paths (empty, root, or None)
+        if not patch.path or patch.path == "/" or patch.path.strip() == "":
+            logger.warning(f"Skipping invalid patch path: '{patch.path}'")
+            return data
+
         # Store old value if not already set
         if patch.old_value is None:
-            patch.old_value = copy.deepcopy(self.get_value(data, patch.path))
+            try:
+                patch.old_value = copy.deepcopy(self.get_value(data, patch.path))
+            except (KeyError, IndexError):
+                patch.old_value = None
 
         # Apply the replacement
         self.set_value(data, patch.path, patch.value)

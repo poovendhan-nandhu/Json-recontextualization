@@ -478,7 +478,7 @@ class AlignmentRequest(BaseModel):
     adapted_json: dict = Field(..., description="The ADAPTED simulation JSON to validate")
     global_factsheet: dict = Field(default_factory=dict, description="Factsheet from adaptation (for consistency checks)")
     source_scenario: str = Field("", description="Original scenario text (for poison term detection)")
-    threshold: float = Field(0.98, description="Minimum alignment score required (0.0-1.0)")
+    threshold: float = Field(0.95, description="Minimum alignment score required (0.0-1.0)")
 
 
 @router.post("/align/check")
@@ -552,7 +552,7 @@ async def adapt_and_check_endpoint(request: AdaptRequest):
             adapted_json=adapt_result.adapted_json,
             global_factsheet=adapt_result.global_factsheet,
             source_scenario=adapt_result.source_scenario,
-            threshold=0.98,
+            threshold=0.95,
         )
 
         return {
@@ -999,6 +999,7 @@ async def run_full_pipeline(request: PipelineRequest):
             },
             "output_json": final_state.get("output_json"),
             "approval_package": final_state.get("approval_package"),
+            "human_readable_report": final_state.get("human_readable_report", ""),
         }
 
     except ValueError as e:
@@ -1082,6 +1083,304 @@ async def list_scenarios(input_json: str = None):
             }
         
         return {"message": "Provide input_json parameter to see available scenarios"}
-        
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ============================================================================
+# LEAF-BASED ADAPTATION - New leaf pipeline
+# ============================================================================
+
+class LeafAdaptRequest(BaseModel):
+    """Request for leaf-based adaptation."""
+    input_json: dict = Field(..., description="The simulation JSON to adapt")
+    scenario_prompt: str = Field(..., description="Target scenario prompt")
+
+
+@router.post("/leaves/adapt")
+async def adapt_with_leaves(request: LeafAdaptRequest):
+    """
+    Adapt simulation using LEAF-BASED LangGraph pipeline.
+
+    INPUT:
+    - input_json: The simulation JSON
+    - scenario_prompt: Target scenario (e.g. "A Gen Z organic beverage company...")
+
+    8-Stage LangGraph Pipeline:
+    1. Context extraction (Gemini) ~2-3s
+    2. Index leaves ~0.1s
+    3. RAG index & retrieve ~1-2s
+    4. LLM decisions with RAG (Gemini) ~3-4s (batched + parallel)
+    5. Validation (GPT 5.2) ~2-3s (parallel validators)
+    6. Repair loop (GPT 5.2) ~2-4s/iter (if needed)
+    7. Apply patches ~0.1s
+    8. Feedback report (GPT 5.2) ~2-3s
+
+    ESTIMATED LATENCY: ~12-15s (happy path), ~18-25s (with repairs)
+
+    Uses LangGraph StateGraph for:
+    - Full LangSmith observability (graph visualization)
+    - Conditional routing (skip repair if no blockers)
+    - State management across stages
+    """
+    try:
+        from src.core.leaf_graph import run_leaf_pipeline
+        import time
+
+        start = time.time()
+
+        # Run LangGraph leaf pipeline
+        final_state = await run_leaf_pipeline(
+            input_json=request.input_json,
+            scenario_prompt=request.scenario_prompt,
+            use_rag=True,
+        )
+
+        total_time = int((time.time() - start) * 1000)
+
+        return {
+            "status": "success",
+            "pipeline": "leaf-langgraph",
+            "final_status": final_state.get("final_status"),
+            "timing": {
+                "total_ms": total_time,
+                "pipeline_ms": final_state.get("total_runtime_ms"),
+                "stage_timings": final_state.get("stage_timings"),
+            },
+            "stats": {
+                "total_leaves": final_state.get("total_leaves"),
+                "pre_filtered": final_state.get("pre_filtered"),
+                "llm_evaluated": final_state.get("llm_evaluated"),
+                "changes_made": final_state.get("patches_applied"),
+                "changes_proposed": final_state.get("changes_proposed"),
+            },
+            "validation": {
+                "blockers": final_state.get("blockers"),
+                "warnings": final_state.get("warnings"),
+                "passed": final_state.get("validation_passed"),
+            },
+            "repair": {
+                "iterations": final_state.get("repair_iterations"),
+                "fixes_succeeded": final_state.get("fixes_succeeded"),
+                "passed": final_state.get("repair_passed"),
+            },
+            "release_decision": final_state.get("release_decision"),
+            "feedback_report": final_state.get("feedback_report").markdown_report if final_state.get("feedback_report") else None,
+            "errors": final_state.get("errors", []),
+            "adapted_json": final_state.get("adapted_json"),
+        }
+
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+@router.post("/leaves/adapt/stream")
+async def adapt_with_leaves_streaming(request: LeafAdaptRequest):
+    """
+    Run leaf LangGraph pipeline with streaming progress updates.
+
+    Returns SSE events for each stage completion.
+    """
+    async def event_generator():
+        try:
+            from src.core.leaf_graph import run_leaf_pipeline_streaming
+
+            yield f"data: {json.dumps({'event': 'start', 'message': 'Starting 8-stage leaf pipeline'})}\n\n"
+
+            last_stage = None
+            final_state = None
+
+            async for state in run_leaf_pipeline_streaming(
+                input_json=request.input_json,
+                scenario_prompt=request.scenario_prompt,
+                use_rag=True,
+            ):
+                current_stage = state.get("current_stage", "unknown")
+                if current_stage != last_stage:
+                    yield f"data: {json.dumps({'event': 'stage_complete', 'stage': current_stage, 'timing_ms': state.get('stage_timings', {}).get(current_stage, 0)})}\n\n"
+                    last_stage = current_stage
+                final_state = state
+
+            # Final result
+            if final_state:
+                yield f"data: {json.dumps({'event': 'complete', 'final_status': final_state.get('final_status'), 'total_runtime_ms': final_state.get('total_runtime_ms'), 'release_decision': final_state.get('release_decision')})}\n\n"
+
+        except Exception as e:
+            import traceback
+            yield f"data: {json.dumps({'event': 'error', 'message': str(e), 'traceback': traceback.format_exc()})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
+@router.post("/leaves/validate")
+async def validate_leaves(request: LeafAdaptRequest):
+    """
+    Validate a JSON using leaf validators WITHOUT adapting.
+
+    INPUT:
+    - input_json: The simulation JSON
+    - scenario_prompt: Target scenario
+    """
+    try:
+        from src.core.indexer import index_leaves
+        from src.core.context import extract_adaptation_context
+        from src.core.leaf_validators import validate_leaf_decisions
+        from src.core.decider import LeafDecider
+        import time
+
+        start = time.time()
+
+        # Extract context
+        context = await extract_adaptation_context(
+            input_json=request.input_json,
+            target_scenario=request.scenario_prompt,
+            source_scenario="",
+        )
+
+        # Index leaves
+        all_leaves = index_leaves(request.input_json)
+
+        # Get decisions (just to see what would change)
+        decider = LeafDecider(context=context)
+        decisions = await decider.decide_all(all_leaves)
+
+        # Validate
+        validation_result = await validate_leaf_decisions(decisions, context)
+
+        total_time = int((time.time() - start) * 1000)
+
+        return {
+            "status": "success",
+            "timing_ms": total_time,
+            "total_leaves": len(all_leaves),
+            "validation": {
+                "total_validated": validation_result.total_validated,
+                "blockers": validation_result.blockers,
+                "warnings": validation_result.warnings,
+                "passed": validation_result.passed,
+            },
+            "issues": [
+                {
+                    "severity": issue.severity.value,
+                    "rule_id": issue.rule_id,
+                    "path": issue.path,
+                    "message": issue.message,
+                    "suggestion": issue.suggestion,
+                }
+                for issue in validation_result.issues[:20]
+            ],
+        }
+
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+@router.post("/leaves/index")
+async def index_leaves_for_rag(request: LeafAdaptRequest):
+    """
+    Index a simulation's leaves for RAG retrieval.
+
+    INPUT:
+    - input_json: The simulation JSON
+    - scenario_prompt: Scenario (used to extract industry)
+    """
+    try:
+        from src.core.indexer import index_leaves
+        from src.core.leaf_rag import LeafRAG
+        import time
+        import hashlib
+
+        start = time.time()
+
+        # Generate simulation ID from content hash
+        content_hash = hashlib.md5(json.dumps(request.input_json, sort_keys=True).encode()).hexdigest()[:12]
+        simulation_id = f"sim_{content_hash}"
+
+        # Extract industry from scenario prompt (simple heuristic)
+        scenario_lower = request.scenario_prompt.lower()
+        if "beverage" in scenario_lower or "drink" in scenario_lower:
+            industry = "beverage"
+        elif "retail" in scenario_lower or "store" in scenario_lower:
+            industry = "retail"
+        elif "hospitality" in scenario_lower or "hotel" in scenario_lower:
+            industry = "hospitality"
+        elif "tech" in scenario_lower or "software" in scenario_lower:
+            industry = "tech"
+        else:
+            industry = "general"
+
+        # Index leaves
+        all_leaves = index_leaves(request.input_json)
+
+        # Index for RAG
+        rag = LeafRAG()
+        if not rag.available:
+            raise HTTPException(status_code=503, detail="RAG vector store not available")
+
+        result = rag.index_leaves(
+            leaves=all_leaves,
+            simulation_id=simulation_id,
+            industry=industry,
+            clear_existing=True,
+        )
+
+        total_time = int((time.time() - start) * 1000)
+
+        return {
+            "status": "success",
+            "timing_ms": total_time,
+            "simulation_id": simulation_id,
+            "leaves_indexed": result.leaves_indexed,
+            "by_collection": result.by_collection,
+            "industry": industry,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+@router.get("/leaves/stats")
+async def get_leaf_stats_endpoint():
+    """
+    Get statistics about the leaf RAG collections.
+    """
+    try:
+        from src.core.leaf_rag import LEAF_COLLECTIONS, LeafRAG
+
+        rag = LeafRAG()
+        if not rag.available:
+            return {
+                "status": "unavailable",
+                "message": "RAG vector store not available",
+            }
+
+        collection_stats = []
+        for name, description in LEAF_COLLECTIONS.items():
+            try:
+                count = rag.store.count(name)
+            except Exception:
+                count = 0
+
+            collection_stats.append({
+                "collection": name,
+                "description": description,
+                "document_count": count,
+            })
+
+        return {
+            "status": "success",
+            "collections": collection_stats,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

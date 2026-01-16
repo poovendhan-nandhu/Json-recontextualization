@@ -15,8 +15,14 @@ Each stage is independent and can be tested/run separately.
 """
 
 from .sharder import Sharder, shard_json, merge_shards
-from .adaptation_engine import AdaptationEngine, adapt_simulation, AdaptationResult
+from .adaptation_engine import (
+    AdaptationEngine,
+    adapt_simulation,
+    adapt_simulation_with_leaves,  # NEW: Leaf-based adaptation
+    AdaptationResult,
+)
 from .alignment_checker import AlignmentChecker, check_alignment, AlignmentReport
+from .alignment_fixer import AlignmentFixer, AlignmentFixResult, fix_alignment_issues
 from .fixers import (
     ScopedFixer,
     StructuralFixer,
@@ -53,11 +59,16 @@ __all__ = [
     # Stage 2: Adaptation
     "AdaptationEngine",
     "adapt_simulation",
+    "adapt_simulation_with_leaves",  # NEW: Leaf-based adaptation
     "AdaptationResult",
     # Stage 3: Alignment Checker
     "AlignmentChecker",
     "check_alignment",
     "AlignmentReport",
+    # Stage 3B: Alignment Fixer (NEW!)
+    "AlignmentFixer",
+    "AlignmentFixResult",
+    "fix_alignment_issues",
     # Stage 4B: Fixers
     "ScopedFixer",
     "StructuralFixer",
