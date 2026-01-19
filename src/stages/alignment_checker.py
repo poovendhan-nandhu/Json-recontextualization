@@ -112,6 +112,7 @@ class AlignmentResult:
     score: float
     issues: list[AlignmentIssue] = field(default_factory=list)
     details: dict = field(default_factory=dict)
+    suggestions: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -246,20 +247,46 @@ class AlignmentChecker:
         blocker_issues = []
         warning_issues = []
 
-        # Run alignment checks in parallel (9 total checkers) using create_task for TRUE parallelism
-        logger.info(f"Running 9 alignment checks in PARALLEL (semaphore limit: {MAX_CONCURRENT_LLM_CALLS})")
+        # Run alignment checks in parallel using create_task for TRUE parallelism
+        # NOTE: KLO checks (R4, R5, R8) are now consolidated into UnifiedKLOValidator
+        logger.info(f"Running 6 alignment checks in PARALLEL + 1 unified KLO check (semaphore limit: {MAX_CONCURRENT_LLM_CALLS})")
+
+        # First, run the unified KLO validator (synchronous, fast)
+        from ..validators.klo_validator import UnifiedKLOValidator
+        klo_validator = UnifiedKLOValidator()
+        klo_result = klo_validator.validate(adapted_json, global_factsheet)
+
+        # Convert KLO result to AlignmentResult format
+        klo_alignment_result = AlignmentResult(
+            rule_id="klo_alignment_unified",
+            rule_name="Unified KLO Alignment (R4+R5+R8)",
+            passed=klo_result.passed,
+            score=klo_result.overall_score,
+            issues=[
+                AlignmentIssue(
+                    rule_id="klo_alignment_unified",
+                    description=issue,
+                    location="klo_validator",
+                    severity=AlignmentSeverity.BLOCKER if not klo_result.passed else AlignmentSeverity.WARNING,
+                )
+                for check in klo_result.checks.values()
+                for issue in check.issues
+            ],
+            suggestions=[klo_result.summary],
+        )
+        results.append(klo_alignment_result)
+        logger.info(f"  {'[PASS]' if klo_result.passed else '[FAIL]'} Unified KLO Alignment: {klo_result.overall_score:.1%}")
+
+        # Remaining checks run in parallel (KLO checks removed - now unified above)
         check_coroutines = [
             # Consistency checks
             self._check_reporting_manager_consistency(adapted_json, global_factsheet),
             self._check_company_consistency(adapted_json, global_factsheet),
             self._check_poison_terms(adapted_json, global_factsheet, source_scenario),
-            # Alignment Matrix checks (from whole_arc.md)
-            self._check_klo_to_questions(adapted_json, global_factsheet),  # KLOs ↔ Questions
-            self._check_klo_to_resources(adapted_json, global_factsheet),  # KLOs ↔ Resources
+            # Alignment Matrix checks (KLO checks moved to unified validator above)
             self._check_scenario_to_resources(adapted_json, global_factsheet),  # Scenario ↔ Resources
             self._check_role_to_tasks(adapted_json, global_factsheet),  # Role ↔ Tasks
             # Coherence checks
-            self._check_klo_alignment(adapted_json, global_factsheet),
             self._check_scenario_coherence(adapted_json, global_factsheet),
         ]
         # Create actual Task objects to force concurrent scheduling
@@ -572,8 +599,10 @@ Look for:
         rule_id = "poison_term_avoidance"
 
         # Filter poison list to remove common English words (second layer of defense)
+        # Pass domain_vocabulary to protect domain-specific terms from being filtered
         raw_poison_list = global_factsheet.get("poison_list", [])
-        poison_list = filter_poison_list(raw_poison_list) if isinstance(raw_poison_list, list) else []
+        domain_vocab = global_factsheet.get("source_domain", {}).get("domain_vocabulary", [])
+        poison_list = filter_poison_list(raw_poison_list, domain_vocabulary=domain_vocab) if isinstance(raw_poison_list, list) else []
         replacement_hints = global_factsheet.get("replacement_hints", {})
 
         # Sample key content for checking

@@ -65,6 +65,81 @@ def fix_content_issues(adapted_json: dict) -> tuple[dict, list[str]]:
     return adapted_json, issues_fixed
 
 
+def fix_poison_terms(adapted_json: dict, poison_list: list, replacement_map: dict) -> tuple[dict, list[str]]:
+    """
+    Replace any remaining poison terms that the LLM missed.
+
+    Args:
+        adapted_json: The adapted simulation JSON
+        poison_list: List of terms to replace (from factsheet)
+        replacement_map: Dict mapping poison terms to replacements
+
+    Returns:
+        (fixed_json, list of replacements made)
+    """
+    fixes = []
+    if not poison_list:
+        return adapted_json, fixes
+
+    # Build case-insensitive replacement patterns
+    # Sort by length (longest first) to avoid partial replacements
+    sorted_terms = sorted(poison_list, key=len, reverse=True)
+
+    def replace_in_text(text: str) -> tuple[str, list[str]]:
+        """Replace poison terms in a single text string."""
+        local_fixes = []
+        if not isinstance(text, str):
+            return text, local_fixes
+
+        for term in sorted_terms:
+            if not term or len(term) < 2:
+                continue
+            # Use word boundary matching to avoid partial replacements
+            pattern = r'\b' + re.escape(term) + r'\b'
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                # Get replacement from map only - no hardcoded replacements
+                replacement = replacement_map.get(term.lower(), replacement_map.get(term, ''))
+                if not replacement:
+                    # No replacement available - skip this term to avoid breaking content
+                    continue
+
+                text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+                local_fixes.append(f"Replaced '{term}' with '{replacement}'")
+
+        return text, local_fixes
+
+    def process_obj(obj):
+        """Recursively process all string values in an object."""
+        nonlocal fixes
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, str):
+                    new_value, local_fixes = replace_in_text(value)
+                    if local_fixes:
+                        obj[key] = new_value
+                        fixes.extend(local_fixes)
+                else:
+                    process_obj(value)
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                if isinstance(item, str):
+                    new_value, local_fixes = replace_in_text(item)
+                    if local_fixes:
+                        obj[i] = new_value
+                        fixes.extend(local_fixes)
+                else:
+                    process_obj(item)
+
+    topic_data = adapted_json.get("topicWizardData", {})
+    process_obj(topic_data)
+
+    if fixes:
+        logger.info(f"[POISON FIXER] Replaced {len(fixes)} remaining poison terms")
+
+    return adapted_json, fixes
+
+
 def fix_duplicate_names(topic_data: dict) -> list[str]:
     """
     Find and fix duplicate activity/stage names in simulationFlow.
@@ -303,9 +378,9 @@ def fix_truncated_urls(topic_data: dict) -> list[str]:
     Fix URLs that were truncated (ending with a dot instead of proper extension).
 
     Common patterns:
-    - avatarF2. → avatarF2.webp
-    - image.png. → image.png (remove trailing dot)
-    - s3.amazonaws.com/path/file. → infer extension from path
+    - avatarF2. -> avatarF2.webp
+    - image.png. -> image.png (remove trailing dot)
+    - s3.amazonaws.com/path/file. -> infer extension from path
     """
     fixes = []
     print(f"[URL FIX] Starting fix_truncated_urls on {type(topic_data)}")
@@ -379,6 +454,10 @@ def remove_placeholders(topic_data: dict) -> list[str]:
         (r'\[PLACEHOLDER\]', ''),
         (r'\[placeholder\]', ''),
         (r'\[brackets\]', ''),
+        # Industry-specific placeholders (critical - must be caught!)
+        (r'\[industry[- ]specific[^\]]*\]', 'performance metrics'),
+        (r'\[metric\]', 'key performance indicator'),
+        (r'\[metrics\]', 'key performance indicators'),
         # Pattern-based placeholders
         (r'\[INSERT[^\]]*\]', ''),
         (r'\[ADD[^\]]*\]', ''),

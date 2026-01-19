@@ -126,19 +126,42 @@ COMMON_ENGLISH_WORDS = {
 }
 
 
-def filter_poison_list(poison_list: list) -> list:
+def filter_poison_list(poison_list: list, domain_vocabulary: list = None) -> list:
     """
     Filter out common English words from the poison list.
+    NEVER filters domain_vocabulary terms - those are critical for domain separation.
+
+    Args:
+        poison_list: Raw poison terms from LLM
+        domain_vocabulary: Domain-specific terms that must NEVER be filtered
 
     Only keeps terms that are truly scenario-specific:
     - Proper nouns (company names, person names)
     - Industry-specific jargon
     - Branded terms
+    - ALL domain_vocabulary terms (protected)
+    - Atomic terms extracted from domain_vocabulary compound phrases
 
     Returns filtered list with only scenario-specific terms.
     """
     if not isinstance(poison_list, list):
         return []
+
+    # Domain vocabulary is PROTECTED - never filter these
+    protected_terms = set()
+    if domain_vocabulary:
+        # Extract both original terms AND atomic (single-word) terms from compounds
+        for term in domain_vocabulary:
+            if isinstance(term, str):
+                term_lower = term.lower().strip()
+                protected_terms.add(term_lower)
+                # Also extract atomic words from compound phrases (e.g., "market analysis" -> "market", "analysis")
+                words = term_lower.split()
+                for word in words:
+                    word_clean = word.strip()
+                    if len(word_clean) >= 2 and word_clean not in {'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'and', 'or'}:
+                        protected_terms.add(word_clean)
+        logger.info(f"[POISON] Protecting {len(protected_terms)} domain vocabulary terms (including atomic extracts)")
 
     filtered = []
     for term in poison_list:
@@ -154,7 +177,12 @@ def filter_poison_list(poison_list: list) -> list:
         if len(term_lower) <= 2:
             continue
 
-        # Skip common English words (case-insensitive)
+        # NEVER filter domain vocabulary terms - these are critical
+        if term_lower in protected_terms:
+            filtered.append(term)
+            continue
+
+        # Skip common English words (case-insensitive) - only for non-domain terms
         if term_lower in COMMON_ENGLISH_WORDS:
             logger.debug(f"Filtered common word from poison list: {term}")
             continue
@@ -164,7 +192,38 @@ def filter_poison_list(poison_list: list) -> list:
         # Keep terms not in common words list
         filtered.append(term)
 
-    logger.info(f"Poison list filtered: {len(poison_list)} -> {len(filtered)} terms")
+    # Ensure ALL domain vocabulary AND their atomic terms are in the list
+    existing_lower = {t.lower() for t in filtered}
+    added_domain_terms = []
+
+    for domain_term in (domain_vocabulary or []):
+        if not isinstance(domain_term, str):
+            continue
+        term_lower = domain_term.lower().strip()
+
+        # Add the original term
+        if term_lower not in existing_lower:
+            filtered.append(domain_term)
+            added_domain_terms.append(domain_term)
+            existing_lower.add(term_lower)
+
+        # Also add atomic (single-word) terms from compound phrases
+        words = term_lower.split()
+        if len(words) > 1:  # Compound phrase
+            for word in words:
+                word_clean = word.strip()
+                # Skip common articles/prepositions
+                if word_clean in {'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'and', 'or', 'at', 'by', 'with'}:
+                    continue
+                if len(word_clean) >= 2 and word_clean not in existing_lower:
+                    filtered.append(word_clean)
+                    added_domain_terms.append(f"{word_clean} (from '{domain_term}')")
+                    existing_lower.add(word_clean)
+
+    if added_domain_terms:
+        logger.info(f"[POISON] Added {len(added_domain_terms)} domain terms (including atomic): {added_domain_terms[:15]}...")
+
+    logger.info(f"[POISON] Poison list: {len(poison_list)} raw -> {len(filtered)} filtered")
     return filtered
 
 
@@ -408,10 +467,17 @@ async def extract_global_factsheet(
                 if 'learner_role' not in result or not result.get('learner_role'):
                     result['learner_role'] = {'role': 'Analyst', 'key_responsibilities': []}
 
+            # Get domain vocabulary from factsheet (domain-specific terms that MUST be protected)
+            source_domain = result.get('source_domain', {})
+            domain_vocabulary = source_domain.get('domain_vocabulary', [])
+            if domain_vocabulary:
+                logger.info(f"[FACTSHEET] Detected source domain: {source_domain.get('domain_name', 'unknown')} with {len(domain_vocabulary)} terms")
+
             # Filter poison list to remove common English words (reduces false positives)
+            # Domain vocabulary terms are PROTECTED and never filtered
             raw_poison_list = result.get('poison_list', [])
             raw_count = len(raw_poison_list) if isinstance(raw_poison_list, list) else 0
-            filtered_poison_list = filter_poison_list(raw_poison_list)
+            filtered_poison_list = filter_poison_list(raw_poison_list, domain_vocabulary=domain_vocabulary)
 
             # CRITICAL: Augment poison list with names extracted from source scenario
             # This ensures person names like "Elizabeth Carter" are always included
@@ -543,9 +609,9 @@ async def adapt_shard_content(
 
             # Log final verification status
             if verification.passed:
-                logger.info(f"[VERIFY] ✅ Shard {shard_id} passed verification" + (f" after {retry_count} retries" if retry_count > 0 else ""))
+                logger.info(f"[VERIFY] [OK] Shard {shard_id} passed verification" + (f" after {retry_count} retries" if retry_count > 0 else ""))
             else:
-                logger.warning(f"[VERIFY] ⚠️ Shard {shard_id} failed after {retry_count} retries: {verification.errors[:2]}")
+                logger.warning(f"[VERIFY] [WARN] Shard {shard_id} failed after {retry_count} retries: {verification.errors[:2]}")
 
             # Extract content (handles both formats)
             adapted_content = extract_adapted_content(result)

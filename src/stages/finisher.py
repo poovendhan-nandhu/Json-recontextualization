@@ -39,8 +39,8 @@ class ComplianceScore:
 
     @property
     def passed(self) -> bool:
-        # Relaxed thresholds - allow some failures
-        return self.blocker_pass_rate >= 0.8 and self.overall_score >= 0.70
+        # Strict thresholds - blockers must all pass, 95% overall required
+        return self.blocker_pass_rate >= 1.0 and self.overall_score >= 0.95
 
 
 @dataclass
@@ -78,10 +78,10 @@ class Finisher:
     Orchestrates the fix-validate cycle until compliance or max iterations.
     """
 
-    # Compliance thresholds (relaxed for better UX)
-    BLOCKER_PASS_RATE_REQUIRED = 0.8    # 80% - allow some blocker failures
-    OVERALL_SCORE_REQUIRED = 0.70       # 70% - more lenient overall
-    MAX_ITERATIONS = 1                   # Don't waste time retrying
+    # Compliance thresholds (strict - per project requirements)
+    BLOCKER_PASS_RATE_REQUIRED = 1.0    # 100% - all blockers MUST pass
+    OVERALL_SCORE_REQUIRED = 0.95       # 95% - per alignment/validation target
+    MAX_ITERATIONS = 3                  # Allow retries for improvement
 
     def __init__(
         self,

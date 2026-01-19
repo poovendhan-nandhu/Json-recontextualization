@@ -24,10 +24,9 @@ def _get_chromadb():
         try:
             import chromadb
             _chromadb = chromadb
-        except ImportError:
-            raise ImportError(
-                "chromadb is required for RAG. Install with: pip install chromadb"
-            )
+        except Exception as e:
+            logger.warning(f"ChromaDB not available: {e}. RAG will be disabled.")
+            return None
     return _chromadb
 
 
@@ -109,12 +108,20 @@ class VectorStore:
         if self._client is None:
             chromadb = _get_chromadb()
 
+            if chromadb is None:
+                logger.warning("ChromaDB unavailable - RAG disabled")
+                return None
+
             # Ensure directory exists
             Path(self.persist_dir).mkdir(parents=True, exist_ok=True)
 
-            # Create persistent client
-            self._client = chromadb.PersistentClient(path=self.persist_dir)
-            logger.info(f"ChromaDB initialized at {self.persist_dir}")
+            try:
+                # Create persistent client
+                self._client = chromadb.PersistentClient(path=self.persist_dir)
+                logger.info(f"ChromaDB initialized at {self.persist_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize ChromaDB: {e}")
+                return None
 
         return self._client
 
@@ -126,8 +133,11 @@ class VectorStore:
             name: Collection name (must be in COLLECTIONS)
 
         Returns:
-            ChromaDB collection
+            ChromaDB collection or None if unavailable
         """
+        if self.client is None:
+            return None
+
         if name not in self.COLLECTIONS:
             raise ValueError(f"Unknown collection: {name}. Valid: {list(self.COLLECTIONS.keys())}")
 
@@ -181,6 +191,10 @@ class VectorStore:
         """
         collection = self.get_collection(collection_name)
 
+        if collection is None:
+            logger.warning(f"Cannot add documents - ChromaDB unavailable")
+            return 0
+
         # Add in batches to avoid memory issues
         batch_size = 100
         total_added = 0
@@ -233,6 +247,9 @@ class VectorStore:
         """
         collection = self.get_collection(collection_name)
 
+        if collection is None:
+            return {"documents": [], "metadatas": [], "distances": []}
+
         results = collection.query(
             query_texts=query_texts,
             n_results=n_results,
@@ -245,20 +262,28 @@ class VectorStore:
     def get_by_id(self, collection_name: str, ids: list[str]) -> dict:
         """Get documents by their IDs."""
         collection = self.get_collection(collection_name)
+        if collection is None:
+            return {"documents": [], "metadatas": [], "ids": []}
         return collection.get(ids=ids)
 
     def delete(self, collection_name: str, ids: list[str]) -> None:
         """Delete documents by IDs."""
         collection = self.get_collection(collection_name)
+        if collection is None:
+            return
         collection.delete(ids=ids)
 
     def count(self, collection_name: str) -> int:
         """Get document count in collection."""
         collection = self.get_collection(collection_name)
+        if collection is None:
+            return 0
         return collection.count()
 
     def clear_collection(self, collection_name: str) -> None:
         """Delete and recreate a collection."""
+        if self.client is None:
+            return
         try:
             self.client.delete_collection(collection_name)
             logger.info(f"Cleared collection: {collection_name}")

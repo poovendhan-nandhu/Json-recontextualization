@@ -285,7 +285,7 @@ def cleanup_merged_json(data: dict) -> dict:
     Fixes:
     - Trailing dots in simulationImage, simulationName
     - Trailing dots in flowProperties.type
-    - Truncated URLs (avatarF2. → avatarF2.webp)
+    - Truncated URLs (avatarF2. -> avatarF2.webp)
     - Placeholder text removal
     - Inconsistent template braces (normalizes to {{{var}}})
 

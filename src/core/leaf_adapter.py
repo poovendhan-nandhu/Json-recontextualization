@@ -9,7 +9,7 @@ This is the main orchestrator that:
 5. Pre-filters leaves (skip IDs, URLs, etc.)
 6. Sends candidates to LLM with SMART PROMPTS + RAG (validation rules built-in) - Gemini
 7. Validates adapted leaves (5 validators) - GPT 5.2
-8. Runs repair loop (Validate → Fix → Re-validate) - GPT 5.2
+8. Runs repair loop (Validate -> Fix -> Re-validate) - GPT 5.2
 9. Applies patches based on LLM decisions
 10. Generates feedback report - GPT 5.2
 
@@ -269,7 +269,7 @@ class LeafAdapter:
     3. PRE-FILTER: Skip IDs, URLs, empty strings (no LLM)
     4. DECIDE: LLM decisions with SMART PROMPTS (Gemini)
     5. VALIDATE: Run 5 validators (GPT 5.2)
-    6. REPAIR: Validate → Fix → Re-validate loop (GPT 5.2)
+    6. REPAIR: Validate -> Fix -> Re-validate loop (GPT 5.2)
     7. PATCH: Apply all "replace" decisions
     8. FEEDBACK: Generate canonical report (GPT 5.2)
 
@@ -429,7 +429,7 @@ class LeafAdapter:
                 max_iterations=self.max_repair_iterations,
             )
             decisions = repair_result.decisions  # Updated decisions
-            logger.info(f"Repair: {repair_result.initial_blockers} → {repair_result.final_blockers} blockers, "
+            logger.info(f"Repair: {repair_result.initial_blockers} -> {repair_result.final_blockers} blockers, "
                        f"{repair_result.total_fixes_succeeded} fixes succeeded")
         else:
             logger.info("STEP 5: Skipping repair loop (no blockers)")

@@ -83,13 +83,13 @@ Before changing anything, ask yourself:
 
 **PRINCIPLE 2: PRESERVE THE PEDAGOGY**
 The LEARNING OBJECTIVE stays the same, only the CONTEXT changes:
-- If it teaches analysis → it should still teach analysis
-- If it assesses decision-making → it should still assess decision-making
-- If it develops critical thinking → it should still develop critical thinking
+- If it teaches analysis -> it should still teach analysis
+- If it assesses decision-making -> it should still assess decision-making
+- If it develops critical thinking -> it should still develop critical thinking
 
 **PRINCIPLE 3: SEMANTIC TRANSFORMATION (NOT WORD REPLACEMENT)**
-❌ WRONG: Find "interview" → Replace with "market analysis"
-✅ RIGHT: Understand the content teaches "structured evaluation" → Rewrite to teach "structured evaluation" in the new domain
+❌ WRONG: Find "interview" -> Replace with "market analysis"
+✅ RIGHT: Understand the content teaches "structured evaluation" -> Rewrite to teach "structured evaluation" in the new domain
 
 **PRINCIPLE 4: COHERENCE CHECK**
 Your output must:

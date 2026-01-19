@@ -453,11 +453,11 @@ class AlignmentFixer:
 AGGRESSIVELY rewrite the submission questions so they DIRECTLY assess each KLO.
 
 **WHAT GOOD KLO-ALIGNED QUESTIONS LOOK LIKE**:
-- If KLO mentions "market sizing" → Question asks for TAM/SAM calculations with sources
-- If KLO mentions "competitive analysis" → Question asks to compare 3+ competitors with data
-- If KLO mentions "financial viability" → Question asks for CAC, LTV, gross margin projections
-- If KLO mentions "risk assessment" → Question asks to identify 3+ risks with mitigations
-- If KLO mentions "recommendation" → Question asks for go/no-go decision with criteria
+- If KLO mentions "market sizing" -> Question asks for TAM/SAM calculations with sources
+- If KLO mentions "competitive analysis" -> Question asks to compare 3+ competitors with data
+- If KLO mentions "financial viability" -> Question asks for CAC, LTV, gross margin projections
+- If KLO mentions "risk assessment" -> Question asks to identify 3+ risks with mitigations
+- If KLO mentions "recommendation" -> Question asks for go/no-go decision with criteria
 
 **WHAT TO AVOID**:
 - Generic rubric questions like "Clarity of Thought", "Critical Thinking"
@@ -512,10 +512,19 @@ Return ONLY a JSON array with the EXACT IDs from above:
                     stage_name = parts[1] if len(parts) > 1 else ""
                     q_type = parts[2] if len(parts) > 2 else "submissionQuestions"
 
-                    for stage in topic.get("simulationFlow", []):
+                    for stage_idx, stage in enumerate(topic.get("simulationFlow", [])):
                         s_name = stage.get("name", "")
-                        # Match by stage name or if stage_name starts with "stage_"
-                        if s_name == stage_name or (stage_name.startswith("stage_") and s_name):
+
+                        # Match by: exact name, stage_N index format, or parsed index
+                        stage_match = (
+                            s_name == stage_name or  # Exact name match
+                            stage_name == f"stage_{stage_idx}" or  # Index-based match (stage_0, stage_1, etc.)
+                            (stage_name.startswith("stage_") and
+                             stage_name.split("_")[-1].isdigit() and
+                             int(stage_name.split("_")[-1]) == stage_idx)  # Parse index from stage_N
+                        )
+
+                        if stage_match:
                             stage_data = stage.get("data", {})
                             q_list = stage_data.get(q_type, [])
                             for q in q_list:
@@ -524,6 +533,7 @@ Return ONLY a JSON array with the EXACT IDs from above:
                                         q["question"] = new_text
                                     else:
                                         q["text"] = new_text
+                                    logger.info(f"[ALIGNMENT FIXER] Applied fix for {q_id} at stage {stage_idx} ({s_name})")
                                     return True
                 return False
 
@@ -1624,7 +1634,7 @@ Return JSON array of resource updates with EXACT IDs from above:
                         if value.get("name") and value["name"] != expected_name:
                             old_name = value["name"]
                             value["name"] = expected_name
-                            changes.append(f"Fixed manager name: '{old_name}' → '{expected_name}' at {new_path}")
+                            changes.append(f"Fixed manager name: '{old_name}' -> '{expected_name}' at {new_path}")
                         if expected_email and value.get("email") and expected_email not in value["email"]:
                             old_email = value["email"]
                             value["email"] = expected_email
@@ -1734,7 +1744,7 @@ Return JSON array of resource updates with EXACT IDs from above:
                         if value != expected_company:
                             for poison in poison_list:
                                 if poison.lower() in value.lower():
-                                    changes.append(f"Fixed company name: '{value}' → '{expected_company}' at {new_path}")
+                                    changes.append(f"Fixed company name: '{value}' -> '{expected_company}' at {new_path}")
                                     value = expected_company
                                     break
                         result[key] = value

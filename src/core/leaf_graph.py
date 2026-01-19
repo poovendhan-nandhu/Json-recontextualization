@@ -159,7 +159,7 @@ async def context_node(state: LeafPipelineState) -> LeafPipelineState:
     Stage 1: Extract adaptation context using Gemini.
 
     Extracts:
-    - Company mappings (old → new)
+    - Company mappings (old -> new)
     - KLO terms
     - Poison terms to remove
     - Industry context
@@ -418,7 +418,7 @@ async def repair_node(state: LeafPipelineState) -> LeafPipelineState:
         duration_ms = int((time.time() - start_time) * 1000)
         add_stage_timing(state, "repair", duration_ms)
 
-        logger.info(f"Stage 6 complete: {repair_result.initial_blockers} → "
+        logger.info(f"Stage 6 complete: {repair_result.initial_blockers} -> "
                    f"{repair_result.final_blockers} blockers, "
                    f"{repair_result.total_fixes_succeeded} fixes succeeded")
 
@@ -592,7 +592,7 @@ def create_leaf_workflow():
 
     Flow:
     ┌─────────┐   ┌─────────┐   ┌─────┐   ┌─────────┐
-    │ Context │ → │ Indexer │ → │ RAG │ → │ Decider │
+    │ Context │ -> │ Indexer │ -> │ RAG │ -> │ Decider │
     └─────────┘   └─────────┘   └─────┘   └─────────┘
                                                │
                                                ▼
@@ -602,13 +602,13 @@ def create_leaf_workflow():
                                               │
                           ┌───────────────────┴───────────────────┐
                           │ blockers > 0?                         │
-                          │  Yes → Repair Loop → Patcher          │
-                          │  No  → Patcher                        │
+                          │  Yes -> Repair Loop -> Patcher          │
+                          │  No  -> Patcher                        │
                           └───────────────────────────────────────┘
                                               │
                                               ▼
                                         ┌──────────┐
-                                        │ Feedback │ → END
+                                        │ Feedback │ -> END
                                         └──────────┘
 
     Returns:
@@ -638,13 +638,13 @@ def create_leaf_workflow():
     # ADD EDGES
     # ==========================================================================
 
-    # Linear flow: Context → Indexer → RAG → Decider → Validation
+    # Linear flow: Context -> Indexer -> RAG -> Decider -> Validation
     workflow.add_edge("context", "indexer")
     workflow.add_edge("indexer", "rag")
     workflow.add_edge("rag", "decider")
     workflow.add_edge("decider", "validation")
 
-    # Conditional: Validation → Repair or Patcher
+    # Conditional: Validation -> Repair or Patcher
     workflow.add_conditional_edges(
         "validation",
         should_repair,
@@ -654,13 +654,13 @@ def create_leaf_workflow():
         }
     )
 
-    # Repair → Patcher
+    # Repair -> Patcher
     workflow.add_edge("repair", "patcher")
 
-    # Patcher → Feedback
+    # Patcher -> Feedback
     workflow.add_edge("patcher", "feedback")
 
-    # Feedback → END
+    # Feedback -> END
     workflow.add_edge("feedback", END)
 
     # ==========================================================================

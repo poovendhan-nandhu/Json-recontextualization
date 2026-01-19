@@ -2,8 +2,8 @@
 State schema for 7-Stage LangGraph workflow.
 
 Follows Shweta's architecture:
-1. Sharder → 2. Adaptation → 3. Alignment → 4. Validation →
-4B. Fixers → 5. Merger → 6. Finisher → 7. Human Approval
+1. Sharder -> 2. Adaptation -> 3. Alignment -> 4. Validation ->
+4B. Fixers -> 5. Merger -> 6. Finisher -> 7. Human Approval
 """
 from typing import TypedDict, Optional, Literal, Any
 from dataclasses import dataclass, field
@@ -36,7 +36,7 @@ class PipelineState(TypedDict, total=False):
     # STAGE 2: ADAPTATION ENGINE OUTPUT
     # ==========================================================================
     adapted_shards: list                      # Adapted Shard objects
-    entity_map: dict[str, str]                # Old entity → New entity mapping
+    entity_map: dict[str, str]                # Old entity -> New entity mapping
     industry: str                             # Detected target industry
     global_factsheet: dict                    # Factsheet with poison_list, hints
     rag_context: dict                         # Industry context from RAG
@@ -47,6 +47,16 @@ class PipelineState(TypedDict, total=False):
     alignment_report: dict                    # AlignmentReport.to_dict()
     alignment_score: float                    # Overall alignment score
     alignment_passed: bool                    # Did alignment pass threshold?
+
+    # ==========================================================================
+    # STAGE 3B: ALIGNMENT FIXER OUTPUT
+    # ==========================================================================
+    alignment_retry_count: int                # Retry counter for alignment fixer
+    alignment_fixes_applied: int              # Count of fixes applied
+    alignment_fixer_skipped: bool             # Was alignment fixer skipped?
+    alignment_fix_results: list               # Results from alignment fixer
+    previous_alignment_score: float           # Score before alignment fixer ran
+    alignment_feedback: dict                  # Feedback from alignment analysis
 
     # ==========================================================================
     # STAGE 4: SCOPED VALIDATION OUTPUT
@@ -60,7 +70,7 @@ class PipelineState(TypedDict, total=False):
     # ==========================================================================
     # STAGE 4B: FIXERS OUTPUT
     # ==========================================================================
-    fix_results: dict[str, dict]              # shard_id → FixResult.to_dict()
+    fix_results: dict[str, dict]              # shard_id -> FixResult.to_dict()
     patches_applied: list[dict]               # All patches for rollback
     fixed_shards: list                        # Shards after fixing
 
@@ -98,7 +108,7 @@ class PipelineState(TypedDict, total=False):
     # EXECUTION METADATA
     # ==========================================================================
     current_stage: str                        # Current stage name
-    stage_timings: dict[str, int]             # Stage → duration_ms
+    stage_timings: dict[str, int]             # Stage -> duration_ms
     total_runtime_ms: int                     # Total pipeline runtime
     retry_count: int                          # Compliance loop retries
     max_retries: int                          # Max allowed retries (default 3)
@@ -157,6 +167,13 @@ def create_initial_state(
         alignment_report={},
         alignment_score=0.0,
         alignment_passed=False,
+        # Alignment fixer state
+        alignment_retry_count=0,
+        alignment_fixes_applied=0,
+        alignment_fixer_skipped=False,
+        alignment_fix_results=[],
+        previous_alignment_score=0.0,
+        alignment_feedback={},
         validation_report={},
         validation_score=0.0,
         validation_passed=False,

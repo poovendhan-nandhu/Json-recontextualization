@@ -263,130 +263,33 @@ async def alignment_node(state: PipelineState) -> PipelineState:
         shard_collection = state.get("shard_collection")
         original_json = state.get("input_json", {})
 
-        # ALIGNMENT + REGENERATION LOOP
-        while regeneration_attempt <= max_regenerations:
-            # Reconstruct adapted JSON for alignment check
-            if shard_collection:
-                adapted_json = merge_shards(shard_collection, original_json)
-            else:
-                adapted_json = original_json.copy()
+        # SINGLE-PASS ALIGNMENT CHECK (retries handled by alignment_fixer_node)
+        # Reconstruct adapted JSON for alignment check
+        if shard_collection:
+            adapted_json = merge_shards(shard_collection, original_json)
+        else:
+            adapted_json = original_json.copy()
 
-            logger.info(f"Running alignment check (attempt {regeneration_attempt + 1})...")
+        logger.info("Running alignment check (single pass - retries via alignment_fixer)...")
 
-            # Run alignment check
-            checker = AlignmentChecker()
-            alignment_report = await checker.check(
-                adapted_json=adapted_json,
-                global_factsheet=global_factsheet,
-                source_scenario=global_factsheet.get("source_scenario", ""),
-            )
+        # Run alignment check ONCE
+        checker = AlignmentChecker()
+        alignment_report = await checker.check(
+            adapted_json=adapted_json,
+            global_factsheet=global_factsheet,
+            source_scenario=global_factsheet.get("source_scenario", ""),
+        )
 
-            state["alignment_report"] = alignment_report.to_dict()
-            state["alignment_score"] = alignment_report.overall_score
-            state["alignment_passed"] = alignment_report.passed
+        state["alignment_report"] = alignment_report.to_dict()
+        state["alignment_score"] = alignment_report.overall_score
+        state["alignment_passed"] = alignment_report.passed
 
-            logger.info(f"Alignment score: {alignment_report.overall_score:.2%}, passed={alignment_report.passed}")
+        logger.info(f"Alignment score: {alignment_report.overall_score:.2%}, passed={alignment_report.passed}")
 
-            # If passed or score >= 95%, we're done
-            if alignment_report.passed or alignment_report.overall_score >= 0.95:
-                logger.info(f"✅ Alignment acceptable ({alignment_report.overall_score:.2%})")
-                break
-
-            # If max attempts reached, stop
-            if regeneration_attempt >= max_regenerations:
-                logger.warning(f"⚠️ Max regeneration attempts ({max_regenerations}) reached. Final score: {alignment_report.overall_score:.2%}")
-                break
-
-            # ⭐ REGENERATE failed shards
-            from ..utils.content_processor import analyze_and_get_feedback
-            from ..utils.gemini_client import regenerate_shards_with_feedback
-
-            feedback, regeneration_prompt = analyze_and_get_feedback(alignment_report.to_dict())
-            state["alignment_feedback"] = {
-                "failed_rules": [r["rule_name"] for r in feedback.failed_rules],
-                "critical_issues": feedback.critical_issues[:5],
-                "suggestions": feedback.suggestions[:3],
-                "focus_shards": feedback.focus_shards,
-                "regeneration_prompt": regeneration_prompt,
-            }
-
-            if not feedback.focus_shards:
-                logger.info("No focus shards identified for regeneration")
-                break
-
-            logger.info(f"🔄 Regenerating shards (attempt {regeneration_attempt + 1}/{max_regenerations}): {feedback.focus_shards}")
-
-            # Prepare shards for regeneration
-            shards_to_regenerate = {}
-
-            # Handle both list of Shard objects and dict formats
-            if isinstance(adapted_shards, list):
-                # List of Shard objects
-                for shard in adapted_shards:
-                    shard_id = shard.id if hasattr(shard, 'id') else str(shard)
-                    shard_content = shard.content if hasattr(shard, 'content') else shard
-                    shard_lower = shard_id.lower()
-                    needs_regen = any(
-                        focus.lower() in shard_lower or shard_lower in focus.lower()
-                        for focus in feedback.focus_shards
-                    )
-                    if needs_regen:
-                        shards_to_regenerate[shard_id] = shard_content
-                        logger.info(f"  → Will regenerate: {shard_id}")
-            else:
-                # Dict format
-                for shard_id, content in adapted_shards.items():
-                    shard_lower = shard_id.lower()
-                    needs_regen = any(
-                        focus.lower() in shard_lower or shard_lower in focus.lower()
-                        for focus in feedback.focus_shards
-                    )
-                    if needs_regen:
-                        shards_to_regenerate[shard_id] = content
-                        logger.info(f"  → Will regenerate: {shard_id}")
-
-            if not shards_to_regenerate:
-                logger.info("No matching shards found for regeneration")
-                break
-
-            # Regenerate shards with feedback
-            feedback_dict = {
-                "failed_rules": feedback.failed_rules,
-                "critical_issues": feedback.critical_issues,
-                "suggestions": feedback.suggestions,
-            }
-
-            regenerated = await regenerate_shards_with_feedback(
-                shards=shards_to_regenerate,
-                global_factsheet=global_factsheet,
-                feedback=feedback_dict,
-            )
-
-            # Update adapted_shards with regenerated content
-            regen_count = 0
-            for shard_id, (new_content, mappings) in regenerated.items():
-                if new_content and new_content != shards_to_regenerate.get(shard_id):
-                    # Handle both list and dict formats
-                    if isinstance(adapted_shards, list):
-                        # Find and update shard in list
-                        for shard in adapted_shards:
-                            if hasattr(shard, 'id') and shard.id == shard_id:
-                                if hasattr(shard, 'content'):
-                                    shard.content = new_content
-                                break
-                    else:
-                        adapted_shards[shard_id] = new_content
-                    regen_count += 1
-                    logger.info(f"  ✅ Regenerated: {shard_id}")
-
-            if regen_count == 0:
-                logger.info("No shards were actually regenerated")
-                break
-
-            state["adapted_shards"] = adapted_shards
-            regeneration_attempt += 1
-            state["regeneration_attempt"] = regeneration_attempt
-            logger.info(f"🔄 Regenerated {regen_count} shards. Re-running alignment check...")
+        if alignment_report.passed or alignment_report.overall_score >= 0.95:
+            logger.info(f"[OK] Alignment passed ({alignment_report.overall_score:.2%})")
+        else:
+            logger.info(f"[WARN] Alignment below 95% - will route to alignment_fixer")
 
         duration_ms = int((time.time() - start_time) * 1000)
         add_stage_timing(state, "alignment", duration_ms)
@@ -413,8 +316,8 @@ async def alignment_fixer_node(state: PipelineState) -> PipelineState:
     Stage 3B: Fix alignment issues BEFORE validation.
 
     This is the KEY FIX for the alignment score problem:
-    - Old flow: alignment → validation → fixers (which fix VALIDATION issues)
-    - New flow: alignment → alignment_fixer → validation → fixers
+    - Old flow: alignment -> validation -> fixers (which fix VALIDATION issues)
+    - New flow: alignment -> alignment_fixer -> validation -> fixers
 
     The alignment_fixer specifically targets ALIGNMENT issues:
     - KLO-Question mapping
@@ -919,14 +822,14 @@ def should_fix_alignment(state: PipelineState) -> str:
     MAX_ALIGNMENT_RETRIES = 2
 
     if alignment_score >= 0.95:
-        print(f"[ALIGNMENT ROUTE] Score {alignment_score:.2%} >= 95%, → validation")
+        print(f"[ALIGNMENT ROUTE] Score {alignment_score:.2%} >= 95%, -> validation")
         return "validation"
 
     if alignment_retry >= MAX_ALIGNMENT_RETRIES:
-        print(f"[ALIGNMENT ROUTE] Max retries ({MAX_ALIGNMENT_RETRIES}) reached, → validation")
+        print(f"[ALIGNMENT ROUTE] Max retries ({MAX_ALIGNMENT_RETRIES}) reached, -> validation")
         return "validation"
 
-    print(f"[ALIGNMENT ROUTE] Score {alignment_score:.2%} < 95%, retry {alignment_retry}/{MAX_ALIGNMENT_RETRIES} → alignment_fixer")
+    print(f"[ALIGNMENT ROUTE] Score {alignment_score:.2%} < 95%, retry {alignment_retry}/{MAX_ALIGNMENT_RETRIES} -> alignment_fixer")
     return "alignment_fixer"
 
 
@@ -942,18 +845,12 @@ def should_retry_alignment(state: PipelineState) -> str:
 
     print(f"[ALIGNMENT RETRY] retry={alignment_retry}/{MAX_ALIGNMENT_RETRIES}, fixes={fixes_applied}")
 
-    # If max retries reached, go to validation
-    if alignment_retry >= MAX_ALIGNMENT_RETRIES:
-        print(f"[ALIGNMENT RETRY] → validation (max retries {MAX_ALIGNMENT_RETRIES} reached)")
-        return "validation"
-
-    # If we made fixes AND under max retries, re-check alignment
+    # ALWAYS go to validation after alignment_fixer - no re-checking alignment
+    # (alignment re-check is wasteful and adds 27s+ latency per retry)
     if fixes_applied > 0:
-        print(f"[ALIGNMENT RETRY] → alignment (retry, {fixes_applied} fixes applied)")
-        return "alignment"
-
-    # No fixes applied, go to validation
-    print("[ALIGNMENT RETRY] → validation (no fixes applied)")
+        print(f"[ALIGNMENT RETRY] -> validation (applied {fixes_applied} fixes, skipping re-check)")
+    else:
+        print("[ALIGNMENT RETRY] -> validation (no fixes to apply)")
     return "validation"
 
 
@@ -980,24 +877,18 @@ def should_retry_compliance(state: PipelineState) -> str:
 
     # Don't retry if already passed
     if alignment_passed:
-        print("[RETRY CHECK] → human_approval (alignment passed)")
+        print("[RETRY CHECK] -> human_approval (alignment passed)")
         return "human_approval"
 
     # Don't retry if max retries reached
     if retry_count >= MAX_RETRIES:
-        print(f"[RETRY CHECK] → human_approval (max retries {MAX_RETRIES} reached)")
+        print(f"[RETRY CHECK] -> human_approval (max retries {MAX_RETRIES} reached)")
         return "human_approval"
 
-    # Don't retry if no patches were applied (no progress)
-    if patches_applied == 0 and retry_count > 0:
-        print("[RETRY CHECK] → human_approval (no patches applied, no progress)")
-        return "human_approval"
-
-    # Retry: increment counter and go back to ALIGNMENT (not validation)
-    # We need to re-check alignment score after fixes
-    state["compliance_retry_count"] = retry_count + 1
-    print(f"[RETRY CHECK] → alignment (retry {retry_count + 1})")
-    return "alignment"
+    # Don't retry - go directly to human_approval
+    # (routing back to alignment adds 27s+ latency and rarely improves scores)
+    print("[RETRY CHECK] -> human_approval (no retry loop - reduces latency)")
+    return "human_approval"
 
 
 def should_abort(state: PipelineState) -> str:
@@ -1020,13 +911,13 @@ def create_adaptation_workflow():
 
     NEW FLOW (fixes the alignment score problem):
     ┌─────────┐   ┌────────────┐   ┌───────────┐
-    │ Sharder │ → │ Adaptation │ → │ Alignment │
+    │ Sharder │ -> │ Adaptation │ -> │ Alignment │
     └─────────┘   └────────────┘   └─────┬─────┘
                                          │
                        ┌─────────────────┴─────────────────┐
                        │ alignment_score >= 98%?           │
-                       │  Yes → Validation                 │
-                       │  No  → Alignment Fixer ───┐       │
+                       │  Yes -> Validation                 │
+                       │  No  -> Alignment Fixer ───┐       │
                        └───────────────────────────┼───────┘
                                                    │
                          ┌─────────────────────────┘
@@ -1038,9 +929,9 @@ def create_adaptation_workflow():
                            │
               ┌────────────┴────────────┐
               │ fixes_applied > 0?      │
-              │  Yes & retries < 2 →    │
+              │  Yes & retries < 2 ->    │
               │       back to Alignment │
-              │  No → Validation        │
+              │  No -> Validation        │
               └────────────────────────-┘
                            │
                            ▼
@@ -1050,8 +941,8 @@ def create_adaptation_workflow():
                         │
         ┌───────────────┴───────────────┐
         │ validation_passed?            │
-        │  Yes → Merger                 │
-        │  No  → Fixers → Merger        │
+        │  Yes -> Merger                 │
+        │  No  -> Fixers -> Merger        │
         └───────────────────────────────┘
                         │
                         ▼
@@ -1092,23 +983,23 @@ def create_adaptation_workflow():
     # ADD EDGES
     # ==========================================================================
 
-    # Stage 1 → Stage 2
+    # Stage 1 -> Stage 2
     workflow.add_edge("sharder", "adaptation")
 
-    # Stage 2 → Stage 3
+    # Stage 2 -> Stage 3
     workflow.add_edge("adaptation", "alignment")
 
-    # Stage 3 → Stage 3B or Stage 4 (NEW conditional for alignment fixer)
+    # Stage 3 -> Stage 3B or Stage 4 (NEW conditional for alignment fixer)
     workflow.add_conditional_edges(
         "alignment",
         should_fix_alignment,  # NEW! Decides if alignment fixer should run
         {
-            "alignment_fixer": "alignment_fixer",  # Score < 98% → fix alignment issues
-            "validation": "validation",             # Score >= 98% → skip to validation
+            "alignment_fixer": "alignment_fixer",  # Score < 98% -> fix alignment issues
+            "validation": "validation",             # Score >= 98% -> skip to validation
         }
     )
 
-    # Stage 3B → Stage 3 (re-check) or Stage 4 (NEW conditional for retry)
+    # Stage 3B -> Stage 3 (re-check) or Stage 4 (NEW conditional for retry)
     workflow.add_conditional_edges(
         "alignment_fixer",
         should_retry_alignment,  # NEW! Smart retry based on improvement
@@ -1118,27 +1009,27 @@ def create_adaptation_workflow():
         }
     )
 
-    # Stage 4 → Stage 4B or Stage 5 (conditional)
+    # Stage 4 -> Stage 4B or Stage 5 (conditional)
     workflow.add_conditional_edges(
         "validation",
         should_fix,
         {
-            "fixers": "fixers",    # Has issues → fix them (validation issues)
-            "merger": "merger",    # No issues → skip to merger
+            "fixers": "fixers",    # Has issues -> fix them (validation issues)
+            "merger": "merger",    # No issues -> skip to merger
         }
     )
 
-    # Stage 4B → Stage 5
+    # Stage 4B -> Stage 5
     workflow.add_edge("fixers", "merger")
 
-    # Stage 5 → Stage 6
+    # Stage 5 -> Stage 6
     workflow.add_edge("merger", "finisher")
 
-    # Stage 6 → Stage 7 (simplified - no more wasteful retry loop)
+    # Stage 6 -> Stage 7 (simplified - no more wasteful retry loop)
     # The alignment loop already handles retries, so finisher goes directly to human
     workflow.add_edge("finisher", "human_approval")
 
-    # Stage 7 → END
+    # Stage 7 -> END
     workflow.add_edge("human_approval", END)
 
     # ==========================================================================

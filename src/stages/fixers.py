@@ -1,7 +1,7 @@
 """
 Stage 4B: Scoped Fixers (Hybrid Approach)
 
-LLM identifies exact fields to fix → outputs JSON Pointer paths
+LLM identifies exact fields to fix -> outputs JSON Pointer paths
 Patcher applies surgical 'replace' operations
 Stores old values for rollback
 
@@ -484,7 +484,7 @@ class SemanticFixer:
         prompt_type = get_prompt_type_for_shard(shard_id)
         prompt_template = get_prompt_for_shard(shard_id)
 
-        print(f"[SEMANTIC FIXER] Shard {shard_id} → using {prompt_type} prompt")
+        print(f"[SEMANTIC FIXER] Shard {shard_id} -> using {prompt_type} prompt")
 
         # Format the specialized prompt
         prompt = prompt_template.format(
@@ -1043,11 +1043,35 @@ class BatchedSemanticFixer:
                 changes_made=["No fixes to apply"]
             )
 
+        # Build set of paths already fixed by alignment fixer - don't overwrite
+        alignment_fixes = context.get("alignment_fix_results", [])
+        protected_paths = set()
+        for fix_result in alignment_fixes:
+            if isinstance(fix_result, dict):
+                for change in fix_result.get("changes", []):
+                    if isinstance(change, str):
+                        # Extract path from change description like "Fixed at path/to/field"
+                        if "at " in change:
+                            protected_paths.add(change.split("at ")[-1].strip())
+                        elif ":" in change:
+                            protected_paths.add(change.split(":")[0].strip())
+                # Also check for direct path field
+                if fix_result.get("path"):
+                    protected_paths.add(fix_result["path"])
+
+        if protected_paths:
+            logger.info(f"[SEMANTIC FIXER] Protecting {len(protected_paths)} paths from alignment fixer")
+
         # Convert fixes to PatchOps
         patches = []
         for fix in fixes:
             try:
                 path = fix.get("path", "")
+
+                # Skip paths protected by alignment fixer
+                if any(protected_path in path for protected_path in protected_paths):
+                    logger.debug(f"Skipping {path} - protected by alignment fixer")
+                    continue
 
                 # Skip invalid paths (empty, root, or None)
                 if not path or path == "/" or path.strip() == "":

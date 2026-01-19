@@ -514,7 +514,7 @@ class ContentPostProcessor:
         """Get a generic replacement for a wrong term."""
         term_lower = term.lower()
 
-        # Common SaaS/tech terms → generic business terms
+        # Common SaaS/tech terms -> generic business terms
         replacements = {
             "churn": "customer attrition",
             "churn rate": "retention rate",
@@ -528,7 +528,8 @@ class ContentPostProcessor:
             "onboarding": "orientation",
         }
 
-        return replacements.get(term_lower, "[industry-specific metric]")
+        # Return the replacement if found, otherwise return original term (never a placeholder!)
+        return replacements.get(term_lower, term)
 
     def _fix_company_names(self, obj: Any) -> Any:
         """Fix company name typos and variations."""

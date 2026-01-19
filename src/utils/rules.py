@@ -328,7 +328,7 @@ RULES = [
         name="DAG Dependency Integrity",
         severity="systemic",
         impact="system",
-        description="Structural → Semantic → Global sequence enforced",
+        description="Structural -> Semantic -> Global sequence enforced",
         validation_criteria={
             "execution_order": "Rules executed in proper dependency order",
             "barrier_respect": "Structural fixes complete before semantic fixes"

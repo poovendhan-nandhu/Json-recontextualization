@@ -56,7 +56,7 @@ CRITICAL_CHECKS = [
     CheckDefinition(
         id="C2",
         name="KPI Alignment",
-        ensures="Industry KPIs correctly updated (e.g., 'order accuracy' → 'on-time departure')",
+        ensures="Industry KPIs correctly updated (e.g., 'order accuracy' -> 'on-time departure')",
         tier=CheckTier.CRITICAL,
         threshold="100%",
         threshold_value=1.0,
@@ -108,16 +108,19 @@ CRITICAL_CHECKS = [
         fix_agent="Structural Fixer",
         detection_stage="Structural Fixer + Finisher",
     ),
+    # NOTE: C7 is now consolidated into UnifiedKLOValidator (src/validators/klo_validator.py)
+    # The unified validator checks: preservation, questions, resources, tasks alignment
+    # Keeping definition for documentation and backward compatibility
     CheckDefinition(
         id="C7",
-        name="KLO Preservation",
-        ensures="Key Learning Outcomes preserved and mapped to activities",
+        name="KLO Preservation (Unified)",
+        ensures="Key Learning Outcomes preserved and mapped to activities, questions, and resources",
         tier=CheckTier.CRITICAL,
         threshold="≥95%",
         threshold_value=0.95,
         why_it_matters="Lost KLOs defeat the educational purpose of the simulation",
-        fix_agent="Alignment Fixer",
-        detection_stage="Alignment Checker",
+        fix_agent="Alignment Fixer + UnifiedKLOValidator",
+        detection_stage="UnifiedKLOValidator",
     ),
     CheckDefinition(
         id="C8",

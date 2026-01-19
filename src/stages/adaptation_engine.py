@@ -10,7 +10,7 @@ KEY IMPROVEMENTS:
 2. Poison list to avoid source scenario terms
 3. Statistics tracking
 4. LangSmith tracing
-5. LEAF-BASED MODE: Index → Classify → Replace/Rewrite → Patch
+5. LEAF-BASED MODE: Index -> Classify -> Replace/Rewrite -> Patch
 
 Flow (Leaf-Based):
 1. Extract Global Factsheet (one LLM call)
@@ -159,8 +159,8 @@ class AdaptationEngine:
         Adapt simulation to new scenario using parallel shard processing.
 
         TWO INPUT OPTIONS:
-        - Option A: target_scenario_index → Select from existing scenarioOptions
-        - Option B: scenario_prompt → Free-form text (any custom scenario)
+        - Option A: target_scenario_index -> Select from existing scenarioOptions
+        - Option B: scenario_prompt -> Free-form text (any custom scenario)
 
         Args:
             input_json: Original simulation JSON
@@ -324,10 +324,10 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
                     clear_existing=True,  # Fresh index for each run
                 )
                 indexed_info = index_result.get('indexed_by_collection', {}) if isinstance(index_result, dict) else {}
-                print(f"[RAG] ✅ Indexed: {indexed_info}")
+                print(f"[RAG] [OK] Indexed: {indexed_info}")
                 logger.info(f"Indexed input for RAG: {indexed_info}")
             except Exception as e:
-                print(f"[RAG] ❌ Failed to index: {e}")
+                print(f"[RAG] [ERROR] Failed to index: {e}")
                 logger.warning(f"Failed to index input for RAG: {e}")
 
         # 4. Separate locked vs unlocked shards
@@ -525,7 +525,7 @@ Use these KPIs and terminology when adapting content. Replace any wrong terms wi
 
             # Log what we retrieved
             examples_found = sum(1 for v in shard_rag_contexts.values() if v)
-            print(f"[RAG] ✅ Retrieved: {examples_found}/{len(shard_names)} shards got examples")
+            print(f"[RAG] [OK] Retrieved: {examples_found}/{len(shard_names)} shards got examples")
             logger.info(f"RAG retrieval: {examples_found}/{len(shard_names)} shards got examples")
 
             # Cache for potential reuse
@@ -799,7 +799,7 @@ async def adapt_simulation_with_leaves(
     else:
         raise ValueError("Provide either 'scenario_prompt' or 'target_scenario_index'")
 
-    logger.info(f"LEAF-BASED Adaptation: {source_scenario[:50]}... → {target_scenario[:50]}...")
+    logger.info(f"LEAF-BASED Adaptation: {source_scenario[:50]}... -> {target_scenario[:50]}...")
 
     # 2. Extract global factsheet (1 LLM call)
     logger.info("Extracting global factsheet...")

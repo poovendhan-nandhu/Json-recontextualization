@@ -405,8 +405,8 @@ async def adapt_simulation_endpoint(request: AdaptRequest):
     Adapt simulation to a new scenario using PARALLEL shard processing.
 
     TWO INPUT OPTIONS:
-    - Option A: target_scenario_index → Select from existing scenarioOptions in JSON
-    - Option B: scenario_prompt → Free-form text prompt (any custom scenario)
+    - Option A: target_scenario_index -> Select from existing scenarioOptions in JSON
+    - Option B: scenario_prompt -> Free-form text prompt (any custom scenario)
 
     This is Stage 1 of the pipeline:
     1. Shards the JSON into 13 pieces
@@ -470,6 +470,69 @@ async def adapt_simulation_endpoint(request: AdaptRequest):
 
 
 # ============================================================================
+# SIMPLE ADAPTER - Phase 1: Simplified adaptation (scenario prompt + JSON only)
+# ============================================================================
+
+class SimpleAdaptRequest(BaseModel):
+    """Request for simple adaptation endpoint."""
+    input_json: dict = Field(..., description="The simulation JSON to adapt")
+    scenario_prompt: str = Field(..., description="Target scenario - SINGLE SOURCE OF TRUTH")
+
+
+@router.post("/adapt/simple")
+async def adapt_simple_endpoint(request: SimpleAdaptRequest):
+    """
+    SIMPLIFIED adaptation using PARALLEL SHARDS.
+
+    Key insight: Scenario prompt is the SINGLE SOURCE OF TRUTH.
+    All shards get the SAME scenario prompt, so they all derive
+    the same company/KLOs/terminology = cross-connected.
+
+    The LLM derives from scenario:
+    - Company name and industry
+    - Role and challenge
+    - KLOs (Key Learning Outcomes)
+    - Domain terminology
+
+    Args:
+        input_json: The simulation JSON to adapt
+        scenario_prompt: SINGLE SOURCE OF TRUTH for adaptation
+
+    Returns:
+        Adapted JSON with timing stats
+    """
+    try:
+        from src.stages.simple_adapter import adapt_simple
+
+        result = await adapt_simple(
+            input_json=request.input_json,
+            scenario_prompt=request.scenario_prompt,
+        )
+
+        return {
+            "status": "success",
+            "mode": result.mode,
+            "timing": {
+                "time_ms": result.time_ms,
+            },
+            "size": {
+                "input_chars": result.input_chars,
+                "output_chars": result.output_chars,
+            },
+            "shards_processed": result.shards_processed,
+            "errors": result.errors,
+            "scenario_prompt": result.scenario_prompt[:200] + "..." if len(result.scenario_prompt) > 200 else result.scenario_prompt,
+            "adapted_json": result.adapted_json,
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+# ============================================================================
 # ALIGNMENT CHECKER - Stage 3: LLM-based cross-shard consistency validation
 # ============================================================================
 
@@ -520,7 +583,7 @@ async def adapt_and_check_endpoint(request: AdaptRequest):
     """
     Full pipeline: Adapt + Alignment Check in one call.
 
-    Runs Stage 2 (Adaptation) → Stage 3 (Alignment Check) sequentially.
+    Runs Stage 2 (Adaptation) -> Stage 3 (Alignment Check) sequentially.
     """
     try:
         from src.stages.adaptation_engine import AdaptationEngine

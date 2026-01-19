@@ -423,7 +423,7 @@ def log_force_replace_summary(leaves: List[Tuple[str, Any]]) -> Dict[str, int]:
     if force_replace_paths:
         logger.info(f"[FORCE_REPLACE] {len(force_replace_paths)} leaves MUST be replaced:")
         for p in force_replace_paths[:10]:  # Show first 10
-            logger.info(f"  → {p}")
+            logger.info(f"  -> {p}")
         if len(force_replace_paths) > 10:
             logger.info(f"  ... and {len(force_replace_paths) - 10} more")
 

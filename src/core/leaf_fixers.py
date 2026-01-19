@@ -121,11 +121,11 @@ class LeafEntityFixer:
             prompt = f"""Fix this text by removing old company/industry references.
 
 ## OLD REFERENCES TO REMOVE:
-{json.dumps(context.poison_terms[:20])}
+{json.dumps(context.poison_terms)}
 
 ## REPLACEMENT MAPPINGS:
-- Old company → {context.new_company_name}
-- Old industry → {context.target_industry}
+- Old company -> {context.new_company_name}
+- Old industry -> {context.target_industry}
 {self._format_entity_map(context.entity_map)}
 
 ## TEXT TO FIX:
@@ -179,7 +179,7 @@ class LeafEntityFixer:
         """Format entity map for prompt."""
         if not entity_map:
             return ""
-        lines = [f"- {old} → {new}" for old, new in entity_map.items()]
+        lines = [f"- {old} -> {new}" for old, new in entity_map.items()]
         return "\n".join(lines)
 
     def _extract_fixed_text(self, content: str) -> Optional[str]:

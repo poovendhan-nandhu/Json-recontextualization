@@ -393,7 +393,7 @@ class FeedbackAgent:
             for i, issue in enumerate(blockers[:10], 1):
                 lines.append(f"{i}. [{issue.rule_id}] {issue.message}")
                 if issue.suggestion:
-                    lines.append(f"   → Suggestion: {issue.suggestion}")
+                    lines.append(f"   -> Suggestion: {issue.suggestion}")
 
         if warnings:
             lines.append(f"\n**WARNINGS ({len(warnings)}):**")

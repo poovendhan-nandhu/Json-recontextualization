@@ -726,7 +726,7 @@ class ContentCompletenessValidator(BaseValidator):
         Returns list of (path, word_count) tuples for sparse resources.
         """
         sparse = []
-        MIN_RESOURCE_WORDS = 300  # Minimum words for a useful resource
+        MIN_RESOURCE_WORDS = 500  # Minimum words for a useful resource (increased for KLO coverage)
 
         # Fields that should have substantial content in resources
         content_fields = ['markdownText', 'content', 'description', 'text']

@@ -140,7 +140,7 @@ class LeafClassifier:
     def _classify_single(self, path: str, value: Any) -> ClassifiedLeaf:
         """Classify a single leaf."""
 
-        # 1. Non-string values → SKIP
+        # 1. Non-string values -> SKIP
         if not isinstance(value, str):
             return ClassifiedLeaf(
                 path=path,
@@ -149,7 +149,7 @@ class LeafClassifier:
                 reason="non-string value"
             )
 
-        # 2. Empty strings → SKIP
+        # 2. Empty strings -> SKIP
         if not value.strip():
             return ClassifiedLeaf(
                 path=path,
@@ -158,7 +158,7 @@ class LeafClassifier:
                 reason="empty string"
             )
 
-        # 3. Locked fields → SKIP
+        # 3. Locked fields -> SKIP
         for pattern in self.locked_patterns:
             if re.match(pattern, path):
                 return ClassifiedLeaf(
@@ -168,7 +168,7 @@ class LeafClassifier:
                     reason=f"locked field: {pattern}"
                 )
 
-        # 4. Check for entity replacements → REPLACE
+        # 4. Check for entity replacements -> REPLACE
         replacement, matched_term = self._find_replacement(value)
         if replacement:
             return ClassifiedLeaf(
@@ -189,7 +189,7 @@ class LeafClassifier:
                     reason=f"contains poison term: {poison}"
                 )
 
-        # 6. Long text content → REWRITE (likely needs context adaptation)
+        # 6. Long text content -> REWRITE (likely needs context adaptation)
         if len(value) > 100:
             return ClassifiedLeaf(
                 path=path,
@@ -198,7 +198,7 @@ class LeafClassifier:
                 reason="long text content needs context adaptation"
             )
 
-        # 7. Short text without entities → SKIP (labels, titles, etc.)
+        # 7. Short text without entities -> SKIP (labels, titles, etc.)
         return ClassifiedLeaf(
             path=path,
             value=value,

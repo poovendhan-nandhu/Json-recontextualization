@@ -1,5 +1,5 @@
 """
-Leaf Repair Loop - Validate → Fix → Re-validate cycle with SMART RETRIES.
+Leaf Repair Loop - Validate -> Fix -> Re-validate cycle with SMART RETRIES.
 
 Enhanced repair workflow with escalating strategies:
 1. Validate adapted leaves
@@ -318,7 +318,7 @@ class AggressiveFixer:
 
 class LeafRepairLoop:
     """
-    Orchestrates the Validate → Fix → Re-validate cycle with ESCALATING STRATEGIES.
+    Orchestrates the Validate -> Fix -> Re-validate cycle with ESCALATING STRATEGIES.
 
     STRATEGY ESCALATION:
     1. STANDARD: Use LeafFixer (semantic LLM fix)
@@ -330,9 +330,9 @@ class LeafRepairLoop:
     2. CHECK: If no blockers, we're done
     3. CATEGORIZE: Group issues by path, check repair history
     4. FIX: Apply appropriate strategy based on history
-       - First attempt → STANDARD
-       - Second attempt → SMART RETRY
-       - Third attempt → AGGRESSIVE
+       - First attempt -> STANDARD
+       - Second attempt -> SMART RETRY
+       - Third attempt -> AGGRESSIVE
     5. UPDATE: Apply fixes back to decisions
     6. RE-VALIDATE: Run validators again
     7. REPEAT: Up to max_iterations
@@ -548,11 +548,11 @@ class LeafRepairLoop:
 
             # Log progress
             if blockers_after < blockers_before:
-                logger.info(f"✓ Progress: {blockers_before} → {blockers_after} blockers")
+                logger.info(f"✓ Progress: {blockers_before} -> {blockers_after} blockers")
             elif blockers_after == blockers_before:
-                logger.warning(f"⚠ No progress: {blockers_before} → {blockers_after} blockers")
+                logger.warning(f"⚠ No progress: {blockers_before} -> {blockers_after} blockers")
             else:
-                logger.error(f"✗ Regression: {blockers_before} → {blockers_after} blockers")
+                logger.error(f"✗ Regression: {blockers_before} -> {blockers_after} blockers")
 
             # Check if all blockers resolved
             if blockers_after == 0:

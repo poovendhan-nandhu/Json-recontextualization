@@ -89,6 +89,11 @@ class ValidationReportData:
     # Aggregated results
     aggregated_results: AggregatedResults
 
+    # Cross-agent reports (for consolidated issues summary)
+    alignment_report: dict = field(default_factory=dict)
+    klo_validation_result: dict = field(default_factory=dict)
+    compliance_result: dict = field(default_factory=dict)
+
     # Fields with defaults (must come after non-default fields)
     audience: str = "PM / Client / QA"  # Target audience for the report
     failure_summaries: list[FailureSummary] = field(default_factory=list)
@@ -438,6 +443,10 @@ class ValidationReportGenerator:
             release_decision=release_decision,
             system_verdict=system_verdict,
             aggregated_results=aggregated,
+            # Cross-agent reports for consolidated issues summary
+            alignment_report=alignment_report,
+            klo_validation_result=compliance_result.get("klo_validation", {}),
+            compliance_result=compliance_result,
             failure_summaries=failure_summaries,
             can_ship_as_is=passed,
             next_action="Ship" if passed else "Review failures",

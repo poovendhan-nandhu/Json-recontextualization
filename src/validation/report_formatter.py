@@ -45,6 +45,7 @@ def format_markdown_report(data: ValidationReportData) -> str:
     sections = [
         _format_header(data),
         _format_executive_gate(data),
+        _format_consolidated_issues(data),  # NEW: All issues in one place
         _format_pipeline_outcomes(data),
         _format_critical_checks(data),
         _format_flagged_checks(data),
@@ -65,7 +66,7 @@ def _format_header(data: ValidationReportData) -> str:
 
     return f"""# Cartedo Simulation Adaptation Framework — Validation Summary Report
 
-**Scenario Change:** {data.original_scenario} → {data.target_scenario}
+**Scenario Change:** {data.original_scenario} -> {data.target_scenario}
 **Report ID:** {report_id}
 **Generated on:** {timestamp}
 **Audience:** {data.audience}
@@ -75,6 +76,150 @@ def _format_header(data: ValidationReportData) -> str:
 ## Run Definition
 
 > One run = the full end-to-end conversion of one simulation into a fully recontextualized "ideal" simulation, including all internal agent passes and the compliance loop."""
+
+
+def _format_consolidated_issues(data: ValidationReportData) -> str:
+    """
+    Format Consolidated Issues Summary - All issues from all agents in one place.
+
+    This section provides a single view of all blockers and warnings across:
+    - Alignment Checker (R1-R9)
+    - KLO Validator (unified)
+    - Scoped Validators (per-shard)
+    - Fixers (structural/semantic)
+    - Finisher (compliance)
+    """
+    output = ["## 📋 Consolidated Issues Summary"]
+    output.append("> All issues from all validation agents in one place.\n")
+
+    # Count totals
+    total_blockers = 0
+    total_warnings = 0
+    all_issues = []
+
+    # 1. Alignment issues
+    alignment_issues = []
+    if hasattr(data, 'alignment_report') and data.alignment_report:
+        for result in data.alignment_report.get('results', []):
+            for issue in result.get('issues', []):
+                severity = issue.get('severity', 'warning')
+                if severity == 'blocker':
+                    total_blockers += 1
+                else:
+                    total_warnings += 1
+                alignment_issues.append({
+                    'agent': 'Alignment Checker',
+                    'rule': result.get('rule_id', 'unknown'),
+                    'severity': severity,
+                    'description': issue.get('description', 'No description'),
+                    'location': issue.get('location', ''),
+                    'suggestion': issue.get('suggestion', ''),
+                })
+
+    # 2. Validation issues (from aggregated results)
+    validation_issues = []
+    if hasattr(data, 'aggregated_results') and data.aggregated_results:
+        for run in data.aggregated_results.run_results:
+            for check_id, check_data in run.check_results.items():
+                if not check_data.get('passed', True):
+                    for issue in check_data.get('issues', []):
+                        severity = issue.get('severity', 'warning')
+                        if severity == 'blocker':
+                            total_blockers += 1
+                        else:
+                            total_warnings += 1
+                        validation_issues.append({
+                            'agent': 'Scoped Validator',
+                            'rule': check_id,
+                            'severity': severity,
+                            'description': issue.get('message', issue.get('description', 'No description')),
+                            'location': issue.get('location', ''),
+                            'shard': issue.get('shard_id', ''),
+                        })
+
+    # 3. Failure summaries
+    failure_issues = []
+    for failure in data.failure_summaries:
+        total_blockers += 1
+        failure_issues.append({
+            'agent': failure.detection_stage,
+            'rule': failure.check_id,
+            'severity': 'blocker',
+            'description': failure.example_issue,
+            'location': failure.where_it_happens,
+            'impact': failure.why_it_matters,
+        })
+
+    # Build summary table
+    output.append("### Issue Counts\n")
+    output.append("| Category | Blockers | Warnings |")
+    output.append("|----------|----------|----------|")
+    output.append(f"| Alignment Checker | {sum(1 for i in alignment_issues if i['severity'] == 'blocker')} | {sum(1 for i in alignment_issues if i['severity'] != 'blocker')} |")
+    output.append(f"| Scoped Validators | {sum(1 for i in validation_issues if i['severity'] == 'blocker')} | {sum(1 for i in validation_issues if i['severity'] != 'blocker')} |")
+    output.append(f"| Critical Failures | {len(failure_issues)} | 0 |")
+    output.append(f"| **TOTAL** | **{total_blockers}** | **{total_warnings}** |")
+
+    # Build detailed issues list (grouped by agent)
+    if alignment_issues:
+        output.append("\n### Alignment Checker Issues\n")
+        output.append("| Rule | Severity | Description | Location |")
+        output.append("|------|----------|-------------|----------|")
+        for issue in alignment_issues[:15]:  # Limit to top 15
+            desc = issue['description'][:60] + '...' if len(issue['description']) > 60 else issue['description']
+            loc = issue['location'][:30] if issue['location'] else '-'
+            sev_icon = "🔴" if issue['severity'] == 'blocker' else "⚠️"
+            output.append(f"| {issue['rule']} | {sev_icon} {issue['severity']} | {desc} | {loc} |")
+        if len(alignment_issues) > 15:
+            output.append(f"| ... | ... | +{len(alignment_issues) - 15} more issues | ... |")
+
+    if validation_issues:
+        output.append("\n### Scoped Validator Issues\n")
+        output.append("| Validator | Severity | Description | Shard |")
+        output.append("|-----------|----------|-------------|-------|")
+        # Group by shard for clarity
+        seen = set()
+        for issue in validation_issues[:20]:  # Limit to top 20
+            key = f"{issue['rule']}:{issue['description'][:30]}"
+            if key in seen:
+                continue
+            seen.add(key)
+            desc = issue['description'][:50] + '...' if len(issue['description']) > 50 else issue['description']
+            shard = issue.get('shard', '-')[:20]
+            sev_icon = "🔴" if issue['severity'] == 'blocker' else "⚠️"
+            output.append(f"| {issue['rule']} | {sev_icon} {issue['severity']} | {desc} | {shard} |")
+        if len(validation_issues) > 20:
+            output.append(f"| ... | ... | +{len(validation_issues) - 20} more issues | ... |")
+
+    if failure_issues:
+        output.append("\n### Critical Failures\n")
+        output.append("| Check | Description | Impact |")
+        output.append("|-------|-------------|--------|")
+        for issue in failure_issues:
+            desc = issue['description'][:50] + '...' if len(issue['description']) > 50 else issue['description']
+            impact = issue.get('impact', '-')[:40] + '...' if len(issue.get('impact', '')) > 40 else issue.get('impact', '-')
+            output.append(f"| {issue['rule']} | 🔴 {desc} | {impact} |")
+
+    # Quick fix suggestions
+    if total_blockers > 0:
+        output.append("\n### Quick Fix Priorities\n")
+        output.append("| Priority | Issue Type | Suggested Fix |")
+        output.append("|----------|------------|---------------|")
+
+        # Extract unique issue types and suggest fixes
+        fix_suggestions = []
+        issue_types = set()
+
+        for issue in alignment_issues + validation_issues:
+            issue_type = issue.get('rule', 'unknown')
+            if issue_type not in issue_types and issue['severity'] == 'blocker':
+                issue_types.add(issue_type)
+                suggestion = issue.get('suggestion', f"Review and fix {issue_type} violations")
+                fix_suggestions.append((issue_type, suggestion))
+
+        for i, (issue_type, suggestion) in enumerate(fix_suggestions[:5], 1):
+            output.append(f"| P{i} | {issue_type} | {suggestion[:60]}{'...' if len(suggestion) > 60 else ''} |")
+
+    return "\n".join(output)
 
 
 def _format_executive_gate(data: ValidationReportData) -> str:
@@ -389,7 +534,7 @@ def _format_failures(data: ValidationReportData) -> str:
 | **Detected by** | {failure.detection_stage} |
 
 **Pointers**
-- Scorecard: `artifacts/{run_id}/rule_scorecard.json` → findings[{failure.check_id}]
+- Scorecard: `artifacts/{run_id}/rule_scorecard.json` -> findings[{failure.check_id}]
 - Offending shards: Check `artifacts/{run_id}/shards/` for affected content
 - Logs: `logs/{run_id}/stage3_unified_checker.log`, `logs/{run_id}/stage6_finisher.log`
 
@@ -499,7 +644,7 @@ def _format_next_actions(data: ValidationReportData) -> str:
     for i, failure in enumerate(data.failure_summaries, 1):
         check = get_check_by_id(failure.check_id)
         agent = check.fix_agent if check else "Semantic Fixer"
-        actions.append(f"{i}. **Fix {failure.failure_type}** via targeted {agent} patch on identified shards → rerun Finisher (dependency recheck only).")
+        actions.append(f"{i}. **Fix {failure.failure_type}** via targeted {agent} patch on identified shards -> rerun Finisher (dependency recheck only).")
 
     # Add improvement actions for flagged issues
     top_flagged = _get_top_flagged_cluster(data)
@@ -742,7 +887,7 @@ def format_slack_report(data: ValidationReportData) -> str:
 
     return f"""{emoji} *Cartedo Validation Report*
 
-*Scenario:* {data.original_scenario} → {data.target_scenario}
+*Scenario:* {data.original_scenario} -> {data.target_scenario}
 *Status:* *{status}*
 *Pass Rate:* {data.critical_pass_rate:.0%} ({data.aggregated_results.runs_passing_critical}/{data.total_runs} runs)
 

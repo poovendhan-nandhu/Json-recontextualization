@@ -18,6 +18,9 @@ DESIGN PRINCIPLES:
 
 import json
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 from typing import Optional
 
 from .rules import (
@@ -41,16 +44,40 @@ FACTSHEET_PROMPT = """You MUST extract a complete factsheet. ALL fields are REQU
 
 ⛔ CRITICAL: You MUST fill ALL fields below. Empty fields = REJECTED.
 
+## DOMAIN DETECTION (CRITICAL - DO THIS FIRST):
+Identify the PRIMARY DOMAIN of the SOURCE scenario:
+- What industry/function is the SOURCE about? (e.g., "HR/Recruitment", "Finance", "Marketing", "Operations", "Healthcare", "Sales", "Supply Chain")
+- What are the CORE VOCABULARY TERMS unique to this domain that MUST be replaced?
+
+You MUST include a "source_domain" field with:
+- domain_name: The identified domain (e.g., "Finance", "Marketing", "Operations", "Healthcare", "Sales")
+- domain_vocabulary: 30+ terms extracted FROM THE ACTUAL SOURCE CONTENT
+
+⚠️ CRITICAL FOR domain_vocabulary:
+- Extract terms DIRECTLY from the SOURCE scenario text
+- MUST include ATOMIC (single-word) domain terms FIRST
+- THEN include compound phrases
+- These are terms that would NOT make sense in the TARGET scenario
+
+How to extract domain_vocabulary:
+1. Read the SOURCE scenario carefully
+2. Identify words/phrases that are SPECIFIC to that domain
+3. List single-word terms first (nouns, verbs specific to that domain)
+4. Then list compound phrases (2-3 word domain-specific terms)
+5. Ask yourself: "Would this term make sense in the TARGET scenario?" If NO, add it.
+
 ## POISON LIST INSTRUCTIONS (VERY IMPORTANT):
 The poison_list must contain ALL terms from the SOURCE scenario that should NOT appear in the adapted content.
 You MUST extract:
 1. ALL person names from SOURCE (both first name AND full name separately)
 2. ALL company/organization names from SOURCE
 3. ALL industry-specific jargon from SOURCE that doesn't fit TARGET
-4. ALL role-specific terms from SOURCE (e.g., if SOURCE is about hiring: "candidate", "interview", "recruitment")
+4. ALL role-specific terms from SOURCE that don't fit TARGET domain
+5. ALL terms from source_domain.domain_vocabulary (CRITICAL - these MUST be included)
 
-Example: If SOURCE has manager "Elizabeth Carter" at "Summit Innovations" doing "hiring":
-poison_list: ["Elizabeth", "Elizabeth Carter", "Summit Innovations", "hiring", "candidate", "interview", "recruitment", "talent acquisition", ...]
+Example: If SOURCE has manager "Jane Smith" at "Acme Corp" in domain X:
+poison_list: ["Jane", "Jane Smith", "Acme Corp", "<domain-specific-term-1>", "<domain-specific-term-2>", ...]
+The domain-specific terms come from your source_domain.domain_vocabulary analysis.
 
 Return this EXACT JSON structure with ALL fields populated:
 
@@ -89,6 +116,10 @@ Return this EXACT JSON structure with ALL fields populated:
     "⚠️ EXACTLY 3 KLOs - no more, no less. KLOs must match TARGET scenario tasks."
   ],
   "poison_list": ["MINIMUM 15 terms from SOURCE: person names, company names, industry jargon - see instructions above"],
+  "source_domain": {{
+    "domain_name": "Primary domain of SOURCE (e.g., HR/Recruitment, Finance, Marketing, Operations)",
+    "domain_vocabulary": ["20+ domain-specific terms that are CENTRAL to SOURCE domain - ALL must be in poison_list"]
+  }},
   "citable_facts": ["10-15 specific facts/numbers relevant to TARGET industry for use in resources"]
 }}
 
@@ -99,6 +130,9 @@ Return this EXACT JSON structure with ALL fields populated:
 - [ ] klos has EXACTLY 3 items that describe TARGET scenario outcomes (NOT source)
 - [ ] poison_list has AT LEAST 15 terms extracted from SOURCE
 - [ ] poison_list includes ALL person names from SOURCE (first AND full name)
+- [ ] poison_list includes ALL terms from source_domain.domain_vocabulary
+- [ ] source_domain.domain_name identifies the SOURCE domain (NOT target)
+- [ ] source_domain.domain_vocabulary has AT LEAST 20 domain-specific terms
 - [ ] industry_context.kpis has AT LEAST 10 items
 - [ ] industry_context.terminology has AT LEAST 10 items
 
@@ -124,19 +158,19 @@ Your output will be programmatically scanned. These checks CANNOT be bypassed:
 **Regex applied to your output:** `\[[^\]]+\]`
 This catches: [anything in brackets], [X], [TBD], [manager name], etc.
 
-If regex finds ANY match → OUTPUT REJECTED, you must regenerate.
+If regex finds ANY match -> OUTPUT REJECTED, you must regenerate.
 
 Examples that WILL trigger rejection:
-- "growing at [X]%" → REJECTED
-- "[industry-specific metric]" → REJECTED
-- "Contact [manager name]" → REJECTED
+- "growing at [X]%" -> REJECTED
+- "[industry-specific metric]" -> REJECTED
+- "Contact [manager name]" -> REJECTED
 
 ✓ Replace ALL brackets with actual values before outputting.
 
 ### BLOCK 2: ZERO POISON TERMS
 **String search applied for each term:** {poison_terms_list}
 
-If ANY term found (case-insensitive) → OUTPUT REJECTED.
+If ANY term found (case-insensitive) -> OUTPUT REJECTED.
 
 The system will literally search for these strings in your JSON output.
 There is no way to hide them. They will be found.
@@ -147,20 +181,20 @@ There is no way to hide them. They will be found.
 - All email "from" fields must contain: {manager_name}
 - All email signatures must contain: {manager_name}
 
-If mismatch detected → OUTPUT REJECTED.
+If mismatch detected -> OUTPUT REJECTED.
 
 ### BLOCK 4: CLEAN FORMATTING
 **Regex applied:** `\.(png|jpg|com|org)\.` and `"[^"]+\."`
 Catches trailing periods on emails, URLs, filenames.
 
-- WRONG: "sophia.chen@retail.com." → REJECTED
-- WRONG: "logo.png." → REJECTED
+- WRONG: "sophia.chen@retail.com." -> REJECTED
+- WRONG: "logo.png." -> REJECTED
 - RIGHT: "sophia.chen@retail.com"
 
 ### BLOCK 5: COMPLETE CONTENT
 **Scan applied for:** `...`, sentences ending without punctuation, `TBD`, `TODO`
 
-Incomplete content → OUTPUT REJECTED.
+Incomplete content -> OUTPUT REJECTED.
 
 ---
 ## ⚠️ CONSEQUENCES
@@ -209,10 +243,10 @@ If any verification fails, your ENTIRE output is rejected.
 }}
 ```
 
-⛔ IF poison_scan_proof.terms_found_in_my_output is NOT empty → REJECTED
-⛔ IF placeholder_scan_proof.brackets_found > 0 → REJECTED  
-⛔ IF sender_consistency_proof.all_match is false → REJECTED
-⛔ IF formatting_proof has any value > 0 → REJECTED
+⛔ IF poison_scan_proof.terms_found_in_my_output is NOT empty -> REJECTED
+⛔ IF placeholder_scan_proof.brackets_found > 0 -> REJECTED  
+⛔ IF sender_consistency_proof.all_match is false -> REJECTED
+⛔ IF formatting_proof has any value > 0 -> REJECTED
 
 The system will verify your claims. If you say "terms_found_in_my_output": [] 
 but "Velocity Dome" appears in adapted_content, you will be caught and rejected.
@@ -286,7 +320,7 @@ Return this EXACT JSON structure:
   "placeholder_scan_proof": {{
     "patterns_i_searched_for": ["[", "{{{{", "TBD", "TODO"],
     "brackets_found": 0,
-    "replacements_i_made": ["[X]% → 12.3%", "[metric] → market share"]
+    "replacements_i_made": ["[X]% -> 12.3%", "[metric] -> market share"]
   }},
   
   "sender_consistency_proof": {{
@@ -350,9 +384,9 @@ def build_shard_adaptation_prompt(
     manager_role = safe_get_str(manager, 'role', 'Director')
     learner_role = safe_get_str(learner, 'role', 'Analyst')
     
-    # Poison list - show ALL terms for the search requirement
+    # Poison list - show ALL terms for the search requirement (not truncated)
     poison_list = safe_get_list(factsheet, 'poison_list', [])
-    poison_terms_list = json.dumps(poison_list[:20]) if poison_list else '["source_company", "source_product"]'
+    poison_terms_list = json.dumps(poison_list) if poison_list else '["source_company", "source_product"]'
 
     # Industry context
     kpis = safe_get_list(industry_ctx, 'kpis', [])
@@ -366,15 +400,31 @@ def build_shard_adaptation_prompt(
     # Get relevant rules for this shard from rules.py
     dynamic_rules = build_rules_section(shard_id)
 
-    # Extract KLOs for alignment (critical for simulation_flow, resources, rubrics)
+    # Extract KLOs for alignment - inject into ALL shards for cross-shard consistency
     klos = safe_get_list(factsheet, 'klos', [])
     klo_text = ""
-    if klos and shard_id.lower() in ['simulation_flow', 'resources', 'rubrics', 'assessment_criteria']:
+    if klos:  # Inject KLOs into ALL shards, not just specific ones
         klo_text = "\n## 🎯 KLOs - ALL CONTENT MUST ALIGN TO THESE:\n"
         for i, klo in enumerate(klos[:5], 1):
             klo_text += f"  KLO{i}: {klo}\n"
-        klo_text += "\n⛔ Activities, questions, and resources MUST directly support these KLOs.\n"
-        klo_text += "⛔ Do NOT include content about unrelated topics (e.g., HR hiring if KLOs are about market analysis).\n"
+        klo_text += "\n⛔ CRITICAL KLO ALIGNMENT REQUIREMENTS:\n"
+        klo_text += "1. Every question MUST use keywords from at least one KLO above\n"
+        klo_text += "2. Every activity MUST reference concepts from the KLOs\n"
+        klo_text += "3. Every resource MUST support learners in achieving the KLOs\n"
+        klo_text += "4. Do NOT include content about unrelated topics - stay focused on the TARGET scenario KLOs\n"
+        klo_text += "\nExample: If KLO says 'evaluate market potential', questions should include words like 'evaluate', 'market', 'potential'\n"
+
+        # Add cross-shard alignment context using aligns_with metadata
+        try:
+            from .config import SHARD_DEFINITIONS
+            shard_def = SHARD_DEFINITIONS.get(shard_id.lower(), {})
+            aligned_shards = shard_def.get("aligns_with", [])
+            if aligned_shards:
+                klo_text += f"\n## 🔗 Cross-Shard Alignment:\n"
+                klo_text += f"This shard MUST be consistent with: {', '.join(aligned_shards)}\n"
+                klo_text += "Ensure terminology, entities, and KLO references match across these shards.\n"
+        except ImportError:
+            pass  # Config not available, skip cross-shard context
 
     # === ASSEMBLE PROMPT ===
 
@@ -468,9 +518,9 @@ def _get_shard_rules(shard_id: str, company_name: str) -> str:
    - "{company_name}'s competitive advantage lies in..."
 
 ⛔ REJECTION TRIGGERS:
-- markdownText under 300 words → REJECTED
-- Statistics without sources → REJECTED
-- Empty or placeholder content → REJECTED"""
+- markdownText under 300 words -> REJECTED
+- Statistics without sources -> REJECTED
+- Empty or placeholder content -> REJECTED"""
     
     elif "email" in shard_lower:
         return f"""1. FROM field = signature (MUST MATCH)
@@ -552,7 +602,7 @@ def build_verification_prompt(
     """Build prompt for verification-only pass."""
     return VERIFICATION_ONLY_PROMPT.format(
         content=json.dumps(content, indent=2, default=str),
-        poison_list=json.dumps(poison_list[:20]),
+        poison_list=json.dumps(poison_list),
         manager_name=manager_name
     )
 

@@ -37,7 +37,7 @@ class AdaptationContext:
     source_industry: str = ""
 
     # Entity mappings (company names only, NOT industry terms)
-    entity_map: Dict[str, str] = field(default_factory=dict)  # old company → new company
+    entity_map: Dict[str, str] = field(default_factory=dict)  # old company -> new company
 
     # REMOVED: industry_term_map - This caused literal replacement!
     # The LLM handles semantic transformation, not term-for-term replacement
@@ -46,7 +46,7 @@ class AdaptationContext:
     poison_terms: List[str] = field(default_factory=list)
 
     # KLO data (for question/rubric alignment)
-    klo_terms: Dict[str, str] = field(default_factory=dict)  # klo1 → "key phrase"
+    klo_terms: Dict[str, str] = field(default_factory=dict)  # klo1 -> "key phrase"
     klo_details: List[Dict] = field(default_factory=list)
 
     # Resource data (for question answerability)
