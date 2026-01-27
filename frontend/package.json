@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start -p $PORT"
+  },
+  "engines": {
+    "node": "18.x"
   },
   "dependencies": {
     "next": "14.0.4",
