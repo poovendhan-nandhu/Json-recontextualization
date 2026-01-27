@@ -43,13 +43,14 @@ async def root():
         "version": config.APP_VERSION,
         "status": "running",
         "endpoints": {
-            "transform": "/api/v1/transform",
-            "validate": "/api/v1/validate",
             "health": "/api/v1/health",
-            "scenarios": "/api/v1/scenarios",
+            "adapt_simple": "/api/v1/adapt/simple",
+            "adapt_simple_ws": "ws://host/api/v1/adapt/simple/ws",
+            "pipeline_ws": "ws://host/api/v1/pipeline/ws",
+            "validate": "/api/v1/validate",
             "validation_report": "/api/v1/validation/report",
-            "validation_report_multi_run": "/api/v1/validation/report/multi-run",
-            "validation_report_from_results": "/api/v1/validation/report/from-results",
+            "shard": "/api/v1/shard",
+            "scenarios": "/api/v1/scenarios",
         }
     }
 
