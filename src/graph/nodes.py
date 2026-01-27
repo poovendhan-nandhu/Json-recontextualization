@@ -532,12 +532,8 @@ def should_repair(state: PipelineState) -> Literal["repair", "finalize"]:
             logger.info(f"[ROUTE] Regression detected ({last_pre_repair_score:.2%} -> {score:.2%}) -> finalize")
             return "finalize"
 
-    # Also stop if score is "good enough" (≥ 85%) to avoid over-repair
-    if score >= 0.85:
-        logger.info(f"[ROUTE] Score {score:.2%} is acceptable (≥85%) -> finalize")
-        return "finalize"
-
-    logger.info(f"[ROUTE] Score {score:.2%} < {PASS_THRESHOLD:.0%} -> repair")
+    # Continue to repair - try to reach 95% target
+    logger.info(f"[ROUTE] Score {score:.2%} < {PASS_THRESHOLD:.0%} -> repair (iter {iteration + 1}/{MAX_REPAIR_ITERATIONS})")
     return "repair"
 
 
