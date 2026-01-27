@@ -319,6 +319,7 @@ async def node_validate(state: PipelineState) -> PipelineState:
         state["validation_passed"] = report.passed
         state["validation_issues"] = []
         state["agent_scores"] = {}
+        state["agent_results"] = report.agent_results  # Store for report generation
 
         # Collect issues and scores
         for agent_result in report.agent_results:
@@ -487,12 +488,15 @@ async def node_finalize(state: PipelineState) -> PipelineState:
 
     if state["final_score"] >= PASS_THRESHOLD:
         state["status"] = "success"
+        state["validation_passed"] = True
         logger.info(f"[NODE] SUCCESS: {state['final_score']:.2%}")
     elif state["final_score"] >= 0.80:
         state["status"] = "partial"
+        state["validation_passed"] = False
         logger.info(f"[NODE] PARTIAL: {state['final_score']:.2%} (below {PASS_THRESHOLD:.0%})")
     else:
         state["status"] = "failed"
+        state["validation_passed"] = False
         logger.info(f"[NODE] FAILED: {state['final_score']:.2%}")
 
     # Calculate total runtime

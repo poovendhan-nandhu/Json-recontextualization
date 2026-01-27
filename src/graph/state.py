@@ -39,6 +39,7 @@ class PipelineState(TypedDict, total=False):
     validation_passed: bool                   # Did it pass threshold?
     validation_issues: list                   # List of issue dicts
     agent_scores: dict                        # {agent_name: score}
+    agent_results: list                       # List of AgentResult objects
 
     # ==========================================================================
     # REPAIR TRACKING
@@ -52,6 +53,7 @@ class PipelineState(TypedDict, total=False):
     final_json: dict                          # Final adapted JSON
     final_score: float                        # Final validation score
     status: str                               # "success" | "partial" | "failed"
+    validation_report: str                    # Markdown validation report
 
     # ==========================================================================
     # EXECUTION METADATA
@@ -92,6 +94,7 @@ def create_initial_state(
         validation_passed=False,
         validation_issues=[],
         agent_scores={},
+        agent_results=[],
 
         # Repair tracking
         repair_iteration=0,

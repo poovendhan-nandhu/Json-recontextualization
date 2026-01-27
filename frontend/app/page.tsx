@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card"
 import { Textarea } from "@/components/ui/textarea"
 import { Badge } from "@/components/ui/badge"
-import { Loader2, CheckCircle2, XCircle, AlertCircle } from "lucide-react"
+import { Loader2, CheckCircle2, XCircle, AlertCircle, FileText } from "lucide-react"
 
 type LogEntry = {
   type: string
@@ -33,6 +33,8 @@ export default function Home() {
   const [logs, setLogs] = useState<LogEntry[]>([])
   const [finalResult, setFinalResult] = useState<any>(null)
   const [error, setError] = useState<string | null>(null)
+  const [validationReport, setValidationReport] = useState<string | null>(null)
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false)
   const wsRef = useRef<WebSocket | null>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
 
@@ -40,8 +42,12 @@ export default function Home() {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
 
+  const getHttpUrl = () => {
+    // Convert ws:// to http:// or wss:// to https://
+    return apiUrl.replace("wss://", "https://").replace("ws://", "http://")
+  }
+
   const runPipeline = () => {
-    // Validate inputs
     if (!scenarioPrompt.trim()) {
       setError("Please enter a scenario prompt")
       return
@@ -59,13 +65,12 @@ export default function Home() {
       return
     }
 
-    // Reset state
     setError(null)
     setLogs([])
     setFinalResult(null)
+    setValidationReport(null)
     setIsRunning(true)
 
-    // Connect WebSocket
     const wsUrl = `${apiUrl}/api/v1/pipeline/ws`
     const ws = new WebSocket(wsUrl)
     wsRef.current = ws
@@ -107,6 +112,49 @@ export default function Home() {
       wsRef.current = null
     }
     setIsRunning(false)
+  }
+
+  const generateReport = async () => {
+    if (!finalResult?.data?.agent_scores) {
+      setError("No validation data available for report")
+      return
+    }
+
+    setIsGeneratingReport(true)
+    setError(null)
+
+    try {
+      // Build agent_results from agent_scores for the report endpoint
+      const agentResults = Object.entries(finalResult.data.agent_scores).map(([name, score]) => ({
+        agent_name: name,
+        score: score,
+        passed: (score as number) >= 0.95,
+        issues: []
+      }))
+
+      const response = await fetch(`${getHttpUrl()}/api/v1/validation/report/from-results`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          validation_results: { agent_results: agentResults },
+          original_scenario: "Source Scenario",
+          target_scenario: scenarioPrompt,
+          simulation_purpose: "Business Simulation Training",
+          output_format: "markdown"
+        })
+      })
+
+      const data = await response.json()
+      if (data.status === "success") {
+        setValidationReport(data.report)
+      } else {
+        setError("Failed to generate report")
+      }
+    } catch (e) {
+      setError(`Report generation failed: ${e}`)
+    } finally {
+      setIsGeneratingReport(false)
+    }
   }
 
   const getScoreColor = (score: number) => {
@@ -250,7 +298,7 @@ export default function Home() {
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-4">
               <div className="text-center p-3 border rounded-md">
                 <div className="text-2xl font-bold">
                   {((finalResult.data?.final_score || 0) * 100).toFixed(1)}%
@@ -278,6 +326,23 @@ export default function Home() {
                   Download JSON
                 </Button>
               </div>
+              <div className="text-center p-3 border rounded-md">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={generateReport}
+                  disabled={isGeneratingReport}
+                >
+                  {isGeneratingReport ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <>
+                      <FileText className="h-4 w-4 mr-1" />
+                      Get Report
+                    </>
+                  )}
+                </Button>
+              </div>
             </div>
 
             {/* Agent Scores */}
@@ -296,6 +361,23 @@ export default function Home() {
                 </div>
               </div>
             )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Validation Report Section */}
+      {validationReport && (
+        <Card className="mb-4">
+          <CardHeader>
+            <CardTitle className="text-lg flex items-center gap-2">
+              <FileText className="h-5 w-5" />
+              Validation Report
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="prose prose-sm max-w-none bg-gray-50 p-4 rounded-md border overflow-auto max-h-[600px]">
+              <pre className="whitespace-pre-wrap text-xs font-mono">{validationReport}</pre>
+            </div>
           </CardContent>
         </Card>
       )}
