@@ -17,10 +17,12 @@ class ShardDefinition(TypedDict):
 
 
 # ============================================================================
-# SHARD DEFINITIONS - Based on sample_main.json structure
+# SHARD DEFINITIONS - Based on Sim2/3/4/5 topic_wizard_data.json structure
 # ============================================================================
 # These define how the simulation JSON is split into independent chunks
 # for parallel processing and scoped validation.
+#
+# NEW FORMAT: Root-level keys with snake_case (no topicWizardData wrapper)
 
 SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     # -------------------------------------------------------------------------
@@ -29,9 +31,9 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "metadata": {
         "name": "Metadata & System IDs",
         "paths": [
-            "topicWizardData.id",
-            "topicWizardData.workspace",
-            "topicWizardData.selectedWorkspaceId",
+            "id",
+            "workspace",
+            "selected_workspace_id",
         ],
         "locked": True,  # System IDs only - never change
         "is_blocker": True,
@@ -41,7 +43,7 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "scenario_options": {
         "name": "Scenario Options",
         "paths": [
-            "topicWizardData.scenarioOptions",
+            "scenario_options",
         ],
         "locked": True,  # Original options never change
         "is_blocker": True,
@@ -55,7 +57,7 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "lesson_information": {
         "name": "Lesson Information",
         "paths": [
-            "topicWizardData.lessonInformation",
+            "lesson_information",
         ],
         "locked": False,  # ✅ NOW UNLOCKED - content changes, structure preserved
         "is_blocker": True,
@@ -65,41 +67,19 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "assessment_criteria": {
         "name": "Assessment Criteria (KLOs)",
         "paths": [
-            "topicWizardData.assessmentCriterion",
-            "topicWizardData.selectedAssessmentCriterion",
+            "assessment_criterion",
+            "selected_assessment_criterion",
         ],
         "locked": False,  # ✅ NOW UNLOCKED - IDs preserved, content adapts
         "is_blocker": True,
         "parallel": True,
         "aligns_with": ["simulation_flow", "rubrics", "workplace_scenario"],
     },
-    "industry_activities": {
-        "name": "Industry Aligned Activities",
-        "paths": [
-            "topicWizardData.industryAlignedActivities",
-            "topicWizardData.selectedIndustryAlignedActivities",
-            # NOTE: chatHistory.industryAlignedActivities moved to locked shard
-        ],
-        "locked": False,  # ✅ NOW UNLOCKED - content adapts
-        "is_blocker": False,
-        "parallel": True,
-        "aligns_with": ["assessment_criteria", "workplace_scenario"],
-    },
-    "activities_chat_history": {
-        "name": "Activities Chat History",
-        "paths": [
-            "topicWizardData.chatHistory.industryAlignedActivities",
-        ],
-        "locked": False,  # UNLOCKED: Activities must align to new scenario/industry
-        "is_blocker": True,
-        "parallel": True,
-        "aligns_with": ["simulation_flow", "workplace_scenario"],
-    },
     "selected_scenario": {
         "name": "Selected Scenario",
         "paths": [
-            "topicWizardData.selectedScenarioOption",
-            "topicWizardData.scenarioDescription",
+            "selected_scenario_option",
+            "scenario_description",
         ],
         "locked": False,
         "is_blocker": True,
@@ -109,27 +89,27 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "workplace_scenario": {
         "name": "Workplace Scenario",
         "paths": [
-            "topicWizardData.workplaceScenario",
+            "workplace_scenario",
         ],
         "locked": False,
         "is_blocker": True,
         "parallel": True,
         "aligns_with": ["selected_scenario", "simulation_flow", "emails"],
     },
-    "scenario_chat_history": {
-        "name": "Scenario Chat History",
+    "chat_history": {
+        "name": "Chat History",
         "paths": [
-            "topicWizardData.chatHistory.scenarioDescription",
+            "chat_history",
         ],
         "locked": False,  # UNLOCKED: Contains manager/company refs that MUST match new scenario
         "is_blocker": True,  # Blocker because it has entity references
         "parallel": True,
-        "aligns_with": ["workplace_scenario", "emails"],
+        "aligns_with": ["workplace_scenario", "assessment_criteria"],
     },
     "simulation_flow": {
         "name": "Simulation Flow (Stages)",
         "paths": [
-            "topicWizardData.simulationFlow",
+            "simulation_flow",
         ],
         "locked": False,  # Content changes, structure preserved
         "is_blocker": True,
@@ -139,8 +119,9 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "emails": {
         "name": "Emails",
         "paths": [
-            "topicWizardData.simulationFlow[*].children[*].data.email",
-            "topicWizardData.simulationFlow[*].data.taskEmail",
+            "emails",
+            "simulation_flow[*].data.task_email",
+            "simulation_flow[*].data.secondary_task_email",
         ],
         "locked": False,
         "is_blocker": False,
@@ -150,8 +131,9 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "rubrics": {
         "name": "Rubrics & Review",
         "paths": [
-            "topicWizardData.simulationFlow[*].data.review.rubric",
-            "topicWizardData.simulationFlow[*].data.review.tedoAlign",
+            "rubric",
+            "simulation_flow[*].data.review.rubric",
+            "simulation_flow[*].data.review.tedo_align",
         ],
         "locked": False,  # Content changes, structure preserved
         "is_blocker": True,
@@ -161,9 +143,8 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "resources": {
         "name": "Resources & Attachments",
         "paths": [
-            "topicWizardData.simulationFlow[*].data.resource",
-            "topicWizardData.simulationFlow[*].data.resourceOptions",
-            "topicWizardData.simulationFlow[*].children[*].data.email.attachments",
+            "simulation_flow[*].data.resource",
+            "simulation_flow[*].data.resource_options",
         ],
         "locked": False,
         "is_blocker": False,
@@ -173,10 +154,10 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "launch_settings": {
         "name": "Launch Settings",
         "paths": [
-            "topicWizardData.launchSettings",
-            "topicWizardData.simulationName",
-            "topicWizardData.simulationImage",
-            "topicWizardData.overview",
+            "launch_settings",
+            "simulation_name",
+            "simulation_image",
+            "overview",
         ],
         "locked": False,
         "is_blocker": False,
@@ -186,8 +167,18 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
     "videos": {
         "name": "Videos",
         "paths": [
-            "topicWizardData.videos",
-            "topicWizardData.simulationFlow[*].children[*].data.video",
+            "videos",
+            "simulation_flow[*].children[*].data.video",
+        ],
+        "locked": False,
+        "is_blocker": False,
+        "parallel": True,
+        "aligns_with": ["workplace_scenario"],
+    },
+    "selected_avatar": {
+        "name": "Selected Avatar",
+        "paths": [
+            "selected_avatar",
         ],
         "locked": False,
         "is_blocker": False,
