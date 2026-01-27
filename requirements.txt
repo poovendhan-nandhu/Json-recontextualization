@@ -1,6 +1,6 @@
 fastapi==0.104.1
 uvicorn==0.24.0
-pydantic==2.5.3
+pydantic>=2.7.4,<3.0.0
 langgraph==0.2.45
 langchain-core==0.3.21
 langchain-openai==0.2.10
@@ -14,8 +14,12 @@ httpx==0.25.2
 pytest==7.4.3
 
 # RAG dependencies
-chromadb==0.4.22
-langchain-chroma==0.2.0
+# Option 1: ChromaDB (local - requires C++ build tools on Windows)
+# chromadb>=0.5.0
+
+# Option 2: Pinecone (cloud - no build tools needed, works on Heroku)
+# Uses Pinecone's built-in inference API (llama-text-embed-v2) - no local embeddings needed
+pinecone>=5.0.0
 
 # LangSmith observability
 langsmith>=0.1.0
