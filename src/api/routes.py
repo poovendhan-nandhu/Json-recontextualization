@@ -1,7 +1,7 @@
 """FastAPI routes for scenario re-contextualization API."""
 import json
 import asyncio
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional
@@ -19,6 +19,13 @@ from src.utils.helpers import compute_sha256, generate_json_diff, search_keyword
 
 # Import sharder
 from src.stages.sharder import Sharder, get_shard_summary, merge_shards
+
+# Import validation report agent
+from src.stages.validation_report_agent import (
+    generate_validation_report_markdown,
+    generate_validation_report_json,
+    aggregate_multi_run_results,
+)
 
 router = APIRouter()
 
@@ -530,6 +537,293 @@ async def adapt_simple_endpoint(request: SimpleAdaptRequest):
     except Exception as e:
         import traceback
         raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+@router.websocket("/adapt/simple/ws")
+async def adapt_simple_websocket(websocket: WebSocket):
+    """
+    WebSocket endpoint for SIMPLIFIED adaptation with real-time progress streaming.
+
+    Connection Protocol:
+    1. Client connects to ws://host/api/v1/adapt/simple/ws
+    2. Client sends JSON: {"input_json": {...}, "scenario_prompt": "..."}
+    3. Server streams progress messages as JSON
+    4. Server sends final result and closes
+
+    Message Types (server -> client):
+    - {"type": "connected", "message": "..."}
+    - {"type": "progress", "stage": "...", "message": "...", "data": {...}}
+    - {"type": "shard_start", "shard_id": "...", "shard_count": N, "current": N}
+    - {"type": "shard_complete", "shard_id": "...", "time_ms": N}
+    - {"type": "result", "status": "success", "data": {...}}
+    - {"type": "error", "message": "...", "traceback": "..."}
+
+    Example client (JavaScript):
+    ```javascript
+    const ws = new WebSocket('ws://localhost:8000/api/v1/adapt/simple/ws');
+    ws.onopen = () => {
+        ws.send(JSON.stringify({
+            input_json: myJson,
+            scenario_prompt: "learners will act as junior consultants..."
+        }));
+    };
+    ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        console.log(msg.type, msg);
+    };
+    ```
+    """
+    await websocket.accept()
+
+    try:
+        # Send connected message
+        await websocket.send_json({
+            "type": "connected",
+            "message": "WebSocket connected. Send {input_json, scenario_prompt} to start adaptation."
+        })
+
+        # Receive request data
+        data = await websocket.receive_json()
+        input_json = data.get("input_json")
+        scenario_prompt = data.get("scenario_prompt")
+
+        if not input_json or not scenario_prompt:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Missing required fields: input_json and scenario_prompt"
+            })
+            await websocket.close()
+            return
+
+        # Import adapter with progress callback support
+        from src.stages.simple_adapter import adapt_simple_with_progress
+
+        # Progress callback that sends WebSocket messages
+        async def progress_callback(event_type: str, data: dict):
+            try:
+                await websocket.send_json({"type": event_type, **data})
+            except Exception:
+                pass  # Connection may have closed
+
+        await websocket.send_json({
+            "type": "progress",
+            "stage": "starting",
+            "message": "Starting adaptation pipeline",
+            "data": {"input_chars": len(json.dumps(input_json))}
+        })
+
+        # Run adaptation with progress streaming
+        result = await adapt_simple_with_progress(
+            input_json=input_json,
+            scenario_prompt=scenario_prompt,
+            progress_callback=progress_callback
+        )
+
+        # Send final result
+        await websocket.send_json({
+            "type": "result",
+            "status": "success",
+            "data": {
+                "mode": result.mode,
+                "time_ms": result.time_ms,
+                "input_chars": result.input_chars,
+                "output_chars": result.output_chars,
+                "shards_processed": result.shards_processed,
+                "errors": result.errors,
+                "entity_map": result.entity_map,
+                "domain_profile": result.domain_profile,
+                "adapted_json": result.adapted_json,
+            }
+        })
+
+    except WebSocketDisconnect:
+        pass  # Client disconnected
+    except json.JSONDecodeError as e:
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Invalid JSON: {str(e)}"
+        })
+    except Exception as e:
+        import traceback
+        await websocket.send_json({
+            "type": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        })
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@router.websocket("/pipeline/ws")
+async def pipeline_websocket(websocket: WebSocket):
+    """
+    WebSocket endpoint for FULL PIPELINE (adapt + validate + repair) with streaming.
+
+    This runs the complete LangGraph pipeline:
+    1. ADAPT - Gemini transforms JSON to target scenario
+    2. VALIDATE - 8 GPT validators check quality
+    3. REPAIR - Fix issues (loops back to VALIDATE if needed)
+    4. FINALIZE - Return final result
+
+    Connection Protocol:
+    1. Client connects to ws://host/api/v1/pipeline/ws
+    2. Client sends JSON: {"input_json": {...}, "scenario_prompt": "..."}
+    3. Server streams progress messages as JSON
+    4. Server sends final result and closes
+
+    Message Types (server -> client):
+    - {"type": "connected", "message": "..."}
+    - {"type": "stage_start", "stage": "adapt|validate|repair|finalize", "iteration": N}
+    - {"type": "stage_complete", "stage": "...", "data": {...}}
+    - {"type": "validation_result", "score": 0.95, "issues": N, "passed": bool}
+    - {"type": "result", "status": "success|partial|failed", "data": {...}}
+    - {"type": "error", "message": "...", "traceback": "..."}
+
+    Example client (JavaScript):
+    ```javascript
+    const ws = new WebSocket('ws://localhost:8000/api/v1/pipeline/ws');
+    ws.onopen = () => {
+        ws.send(JSON.stringify({
+            input_json: myJson,
+            scenario_prompt: "learners will act as junior consultants..."
+        }));
+    };
+    ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'stage_start') {
+            console.log(`Starting ${msg.stage}...`);
+        } else if (msg.type === 'validation_result') {
+            console.log(`Score: ${msg.score}, Issues: ${msg.issues}`);
+        } else if (msg.type === 'result') {
+            console.log('Final result:', msg.data.final_json);
+        }
+    };
+    ```
+    """
+    await websocket.accept()
+
+    try:
+        # Send connected message
+        await websocket.send_json({
+            "type": "connected",
+            "message": "WebSocket connected. Send {input_json, scenario_prompt} to start full pipeline."
+        })
+
+        # Receive request data
+        data = await websocket.receive_json()
+        input_json = data.get("input_json")
+        scenario_prompt = data.get("scenario_prompt")
+
+        if not input_json or not scenario_prompt:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Missing required fields: input_json and scenario_prompt"
+            })
+            await websocket.close()
+            return
+
+        # Import the LangGraph pipeline
+        from src.graph.workflow import run_pipeline_streaming
+        from src.graph.state import create_initial_state
+
+        await websocket.send_json({
+            "type": "stage_start",
+            "stage": "pipeline",
+            "message": "Starting full adaptation pipeline (adapt → validate → repair → finalize)",
+            "data": {"input_chars": len(json.dumps(input_json))}
+        })
+
+        # Track state changes
+        last_stage = None
+        final_state = None
+
+        # Run the streaming pipeline
+        async for state in run_pipeline_streaming(input_json, scenario_prompt):
+            # Detect stage changes by checking which node just completed
+            # LangGraph returns dict with node name as key
+            for node_name, node_state in state.items():
+                if isinstance(node_state, dict):
+                    final_state = node_state
+
+                    # Send stage updates
+                    current_stage = None
+                    if "adapted_json" in node_state and last_stage != "adapt":
+                        current_stage = "adapt"
+                        await websocket.send_json({
+                            "type": "stage_complete",
+                            "stage": "adapt",
+                            "data": {
+                                "shards_processed": node_state.get("shards_processed", 0),
+                                "time_ms": node_state.get("adaptation_time_ms", 0),
+                            }
+                        })
+
+                    if "validation_score" in node_state:
+                        score = node_state.get("validation_score", 0)
+                        issues = len(node_state.get("validation_issues", []))
+                        iteration = node_state.get("repair_iteration", 0)
+
+                        if last_stage != f"validate_{iteration}":
+                            current_stage = "validate"
+                            await websocket.send_json({
+                                "type": "validation_result",
+                                "stage": "validate",
+                                "iteration": iteration,
+                                "score": score,
+                                "issues": issues,
+                                "passed": score >= 0.95,
+                                "agent_scores": node_state.get("agent_scores", {})
+                            })
+                            last_stage = f"validate_{iteration}"
+
+                    if "final_json" in node_state and last_stage != "finalize":
+                        current_stage = "finalize"
+                        last_stage = "finalize"
+
+        # Send final result
+        if final_state:
+            await websocket.send_json({
+                "type": "result",
+                "status": final_state.get("status", "unknown"),
+                "data": {
+                    "final_score": final_state.get("final_score", 0),
+                    "validation_passed": final_state.get("validation_passed", False),
+                    "repair_iterations": final_state.get("repair_iteration", 0),
+                    "agent_scores": final_state.get("agent_scores", {}),
+                    "issues_remaining": len(final_state.get("validation_issues", [])),
+                    "total_runtime_ms": final_state.get("total_runtime_ms", 0),
+                    "errors": final_state.get("errors", []),
+                    "final_json": final_state.get("final_json", {}),
+                }
+            })
+        else:
+            await websocket.send_json({
+                "type": "error",
+                "message": "Pipeline completed but no final state returned"
+            })
+
+    except WebSocketDisconnect:
+        pass  # Client disconnected
+    except json.JSONDecodeError as e:
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Invalid JSON: {str(e)}"
+        })
+    except Exception as e:
+        import traceback
+        await websocket.send_json({
+            "type": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        })
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -1447,3 +1741,282 @@ async def get_leaf_stats_endpoint():
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# VALIDATION REPORT AGENT - Human-readable canonical validation reports
+# ============================================================================
+
+class ValidationReportRequest(BaseModel):
+    """Request for validation report generation."""
+    input_json: dict = Field(..., description="The simulation JSON to validate")
+    scenario_prompt: str = Field(..., description="Target scenario prompt")
+    original_scenario: Optional[str] = Field("", description="Original/source scenario (optional)")
+    simulation_purpose: Optional[str] = Field("Business Simulation Training", description="Purpose of the simulation")
+    output_format: Optional[str] = Field("markdown", description="Output format: 'markdown' or 'json'")
+
+
+class MultiRunReportRequest(BaseModel):
+    """Request for multi-run aggregated report."""
+    run_results: list[dict] = Field(..., description="List of run results from multiple runs")
+    original_scenario: str = Field(..., description="Original scenario")
+    target_scenario: str = Field(..., description="Target scenario")
+    acceptance_threshold: float = Field(0.95, description="Acceptance threshold (default 95%)")
+
+
+@router.post("/validation/report")
+async def generate_validation_report_endpoint(request: ValidationReportRequest):
+    """
+    Generate a CANONICAL VALIDATION REPORT for a simulation adaptation.
+
+    This produces a NON-TECHNICAL, DECISION-FIRST validation report that allows
+    PMs, clients, QA, and prompt engineers to quickly and confidently decide
+    whether a simulation adaptation is ready to ship.
+
+    ## Report Sections:
+    1. **Canonical Header** - Contract metadata (scenarios, mode, timestamp)
+    2. **Executive Decision Gate** - Single-glance go/no-go decision
+    3. **Critical Checks Dashboard** - Non-negotiable blocking checks
+    4. **Flagged Quality Checks** - Non-blocking quality signals
+    5. **What Failed** - Actionable failure summaries
+    6. **Recommended Fixes** - Prioritized fix recommendations
+    7. **Binary System Decision** - Can ship? Is fix isolated? Can rerun?
+    8. **Final One-Line Summary** - Quote-ready summary
+
+    ## Validation Checks:
+
+    **Critical (8 blocking):**
+    - C1: Entity Removal - No original scenario references
+    - C2: KPI Alignment - Industry KPIs correctly updated
+    - C3: Schema Validity - Output JSON conforms to schema
+    - C4: Rubric Integrity - Rubric levels preserved
+    - C5: End-to-End Executability - No missing references
+    - C6: Barrier Compliance - Locked elements never modified
+    - C7: KLO Preservation - Learning outcomes preserved (≥95%)
+    - C8: Resource Completeness - All resources valid
+
+    **Flagged (6 non-blocking):**
+    - F1: Persona Realism (≥85%)
+    - F2: Resource Authenticity (≥85%)
+    - F3: Narrative Coherence (≥90%)
+    - F4: Tone Consistency (≥90%)
+    - F5: Data Realism (≥85%)
+    - F6: Industry Terminology (≥90%)
+
+    Args:
+        request: ValidationReportRequest with input_json and scenario_prompt
+
+    Returns:
+        Validation report in markdown or JSON format
+    """
+    try:
+        from src.stages.simple_validators import run_all_validators
+
+        # Run all 8 validators
+        validation_report = await run_all_validators(
+            adapted_json=request.input_json,
+            scenario_prompt=request.scenario_prompt,
+        )
+
+        # Determine original scenario
+        original_scenario = request.original_scenario
+        if not original_scenario:
+            # Try to extract from input JSON
+            topic_data = request.input_json.get("topicWizardData", {})
+            selected = topic_data.get("selectedScenarioOption", "")
+            if isinstance(selected, dict):
+                original_scenario = selected.get("option", "Unknown source scenario")
+            elif isinstance(selected, str):
+                original_scenario = selected
+            else:
+                original_scenario = "Unknown source scenario"
+
+        # Generate report in requested format
+        if request.output_format == "json":
+            report_data = await generate_validation_report_json(
+                agent_results=validation_report.agent_results,
+                original_scenario=original_scenario,
+                target_scenario=request.scenario_prompt,
+                simulation_purpose=request.simulation_purpose,
+                total_runs=1,
+                acceptance_threshold=0.95,
+            )
+            return {
+                "status": "success",
+                "format": "json",
+                "validation_scores": {
+                    "overall_score": validation_report.overall_score,
+                    "passed": validation_report.passed,
+                    "total_issues": validation_report.total_issues,
+                },
+                "report": report_data,
+            }
+        else:
+            report_markdown = await generate_validation_report_markdown(
+                agent_results=validation_report.agent_results,
+                original_scenario=original_scenario,
+                target_scenario=request.scenario_prompt,
+                simulation_purpose=request.simulation_purpose,
+                total_runs=1,
+                acceptance_threshold=0.95,
+            )
+            return {
+                "status": "success",
+                "format": "markdown",
+                "validation_scores": {
+                    "overall_score": validation_report.overall_score,
+                    "passed": validation_report.passed,
+                    "total_issues": validation_report.total_issues,
+                },
+                "report": report_markdown,
+            }
+
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+@router.post("/validation/report/multi-run")
+async def generate_multi_run_report_endpoint(request: MultiRunReportRequest):
+    """
+    Generate an AGGREGATED validation report across multiple runs.
+
+    This endpoint answers the founder's key question:
+    "How accurate is the agent across multiple runs?"
+
+    For each scenario change, multiple runs may be executed.
+    This endpoint aggregates results and provides:
+    - Overall critical check pass rate across all runs
+    - Per-check pass rates
+    - Common failure patterns
+    - Go/no-go decision based on acceptance threshold
+
+    ## Acceptance Criteria:
+    - System is acceptable when ≥95% of runs pass all Critical checks
+    - Individual checks have their own thresholds
+
+    Args:
+        request: MultiRunReportRequest with list of run results
+
+    Returns:
+        Aggregated report with pass rates per check
+    """
+    try:
+        aggregated = await aggregate_multi_run_results(
+            run_results=request.run_results,
+            original_scenario=request.original_scenario,
+            target_scenario=request.target_scenario,
+            acceptance_threshold=request.acceptance_threshold,
+        )
+
+        return {
+            "status": "success",
+            "aggregated_report": aggregated,
+        }
+
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+
+class ValidationReportFromResultsRequest(BaseModel):
+    """Request for generating report from validation results."""
+    validation_results: dict = Field(..., description="Validation results dict with agent_results")
+    original_scenario: str = Field("", description="Original scenario")
+    target_scenario: str = Field(..., description="Target scenario")
+    simulation_purpose: str = Field("Business Simulation Training", description="Simulation purpose")
+    output_format: str = Field("markdown", description="Output format: markdown or json")
+
+
+@router.post("/validation/report/from-results")
+async def generate_report_from_validation_results(request: ValidationReportFromResultsRequest):
+    """
+    Generate validation report from pre-computed validation results.
+
+    Use this when you've already run validation and want to generate
+    the canonical report without re-running validators.
+
+    The validation_results should contain:
+    - agent_results: list of AgentResult-like dicts with:
+      - agent_name: str
+      - score: float
+      - passed: bool
+      - issues: list of {agent, location, issue, suggestion, severity}
+
+    Args:
+        validation_results: Pre-computed validation results
+        original_scenario: Source scenario description
+        target_scenario: Target scenario description
+        simulation_purpose: Purpose of simulation
+        output_format: "markdown" or "json"
+
+    Returns:
+        Canonical validation report
+    """
+    try:
+        from dataclasses import dataclass, field as dataclass_field
+
+        # Extract from request
+        validation_results = request.validation_results
+        original_scenario = request.original_scenario
+        target_scenario = request.target_scenario
+        simulation_purpose = request.simulation_purpose
+        output_format = request.output_format
+
+        # Convert dict results to AgentResult-like objects
+        @dataclass
+        class MockIssue:
+            agent: str
+            location: str
+            issue: str
+            suggestion: str
+            severity: str = "warning"
+
+        @dataclass
+        class MockAgentResult:
+            agent_name: str
+            score: float
+            passed: bool
+            issues: list = dataclass_field(default_factory=list)
+            details: dict = dataclass_field(default_factory=dict)
+
+        agent_results = []
+        for ar_dict in validation_results.get("agent_results", []):
+            issues = []
+            for issue_dict in ar_dict.get("issues", []):
+                issues.append(MockIssue(
+                    agent=issue_dict.get("agent", ""),
+                    location=issue_dict.get("location", ""),
+                    issue=issue_dict.get("issue", ""),
+                    suggestion=issue_dict.get("suggestion", ""),
+                    severity=issue_dict.get("severity", "warning"),
+                ))
+
+            agent_results.append(MockAgentResult(
+                agent_name=ar_dict.get("agent_name", ar_dict.get("name", "")),
+                score=ar_dict.get("score", 0.0),
+                passed=ar_dict.get("passed", False),
+                issues=issues,
+            ))
+
+        # Generate report
+        if output_format == "json":
+            report_data = await generate_validation_report_json(
+                agent_results=agent_results,
+                original_scenario=original_scenario,
+                target_scenario=target_scenario,
+                simulation_purpose=simulation_purpose,
+            )
+            return {"status": "success", "format": "json", "report": report_data}
+        else:
+            report_md = await generate_validation_report_markdown(
+                agent_results=agent_results,
+                original_scenario=original_scenario,
+                target_scenario=target_scenario,
+                simulation_purpose=simulation_purpose,
+            )
+            return {"status": "success", "format": "markdown", "report": report_md}
+
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")

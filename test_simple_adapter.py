@@ -7,24 +7,37 @@ Run:
 This tests the Phase 1 simplified approach:
 - Scenario Prompt + JSON -> LLM -> Adapted JSON
 - No factsheet, no RAG, no poison lists
+
+Input format: Sim2/3/4/5_topic_wizard_data.json (root-level snake_case keys)
 """
 import asyncio
 import json
 import sys
 import time
+import logging
+
+# Configure logging to see adapter progress
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
 load_dotenv()
 
-# The target scenario prompt (from PROMPT_SIMPLIFICATION.md)
-# This is the SINGLE SOURCE OF TRUTH - LLM derives everything from this
+# Available input files (use Sim5 - HarvestBowls QSR $1 menu response - better match for BurgerBlitz)
+INPUT_FILE = "Sim5_topic_wizard_data.json"
+
+# The target scenario prompt - recontextualize MoodSip to a NEW scenario
+# Example: Change from juice bar to fast food response simulation
 SCENARIO_PROMPT = """
-learners will act as a junior consultant for an exciting Gen Z organic T-shirts brand,
-tasked with analyzing the U.S. market and providing a go/no-go market entry
-recommendation. Using only the simulation's provided data, they will apply structured
-frameworks to assess market potential, competition, capabilities, finances, and risks
-before developing their final strategy.
+Acting as a consultant, students will develop a short executive summary recommending
+how a fast food brand called "BurgerBlitz" should respond to its competitor's $1 menu.
+They'll analyze the competitor's move, market impact, BurgerBlitz's strengths, and
+four strategic options. Their goal is to propose a clear, realistic, and sustainable
+plan to protect or grow market share via an executive summary.
 """
 
 
@@ -33,9 +46,9 @@ async def test_simple_adapter():
     from src.stages.simple_adapter import adapt_simple
     from src.stages.simple_validators import validate_and_repair, run_all_validators
 
-    # Load sample input
-    print("Loading sample_main.json...")
-    with open("sample_main.json", "r", encoding="utf-8") as f:
+    # Load input file
+    print(f"Loading {INPUT_FILE}...")
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
         input_json = json.load(f)
 
     input_size = len(json.dumps(input_json))

@@ -1,799 +1,502 @@
 """
-LangGraph nodes for 7-Stage Simulation Adaptation Pipeline.
+LangGraph Nodes for Simple Adaptation Pipeline.
 
-All nodes have @traceable for LangSmith observability.
+SIMPLIFIED 3-STAGE PIPELINE:
+  ADAPT → VALIDATE → REPAIR (loop) → FINALIZE
 
-Stages:
-1. Sharder - Split JSON into shards
-2. Adaptation Engine - Transform shards with Gemini
-3. Alignment Checker - Cross-shard consistency (GPT-5.2)
-4. Scoped Validation - Per-shard validation (parallel)
-4B. Fixers - Fix failing shards (hybrid LLM + patcher)
-5. Merger - Reassemble shards
-6. Finisher - Compliance loop
-7. Human Approval - Create approval package
+Uses:
+- src/stages/simple_adapter.py (Gemini adaptation)
+- src/stages/simple_validators.py (GPT validation + repair)
+
+Flow:
+    ┌─────────┐
+    │  START  │
+    └────┬────┘
+         │
+         ▼
+    ┌─────────┐
+    │  ADAPT  │  (Gemini 2.5 Flash)
+    └────┬────┘
+         │
+         ▼
+    ┌──────────┐
+    │ VALIDATE │  (6 GPT validators in parallel)
+    └────┬─────┘
+         │
+         ▼
+    ┌────────────────────┐
+    │  score >= 95%?     │
+    │   YES → FINALIZE   │
+    │   NO  → REPAIR     │
+    └─────────┬──────────┘
+              │
+         ┌────┴────┐
+         │  REPAIR │  (Resource Fixer + Generic Patcher)
+         └────┬────┘
+              │
+              ▼
+         (back to VALIDATE, max 3 iterations)
+              │
+              ▼
+    ┌──────────┐
+    │ FINALIZE │
+    └────┬─────┘
+         │
+         ▼
+    ┌─────────┐
+    │   END   │
+    └─────────┘
 """
+import json
 import time
 import logging
-import asyncio
-from typing import Any
-from copy import deepcopy
+from typing import Literal
+from dataclasses import dataclass
 
-from langsmith import traceable
+from langgraph.graph import StateGraph, END
 
-from .state import (
-    PipelineState,
-    add_stage_timing,
-    add_error,
-    add_llm_call,
-)
+try:
+    from langsmith import traceable
+except ImportError:
+    def traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+from .state import PipelineState
 
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# UTILITY: JSON SANITIZATION
-# =============================================================================
-
-def sanitize_json_content(obj: Any) -> Any:
-    """
-    Recursively sanitize JSON content to remove surrogate characters.
-    This prevents UTF-8 encoding errors when sending to LLM APIs.
-    """
-    if isinstance(obj, str):
-        # Remove surrogate characters (\uD800-\uDFFF) that cause encoding errors
-        try:
-            # Encode to UTF-8, replacing surrogates with replacement character
-            return obj.encode('utf-8', errors='surrogatepass').decode('utf-8', errors='replace')
-        except Exception:
-            # Fallback: just strip non-ASCII if encoding fails
-            return ''.join(c if ord(c) < 128 else '?' for c in obj)
-    elif isinstance(obj, dict):
-        return {k: sanitize_json_content(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [sanitize_json_content(item) for item in obj]
-    return obj
+# Thresholds
+PASS_THRESHOLD = 0.95
+MAX_REPAIR_ITERATIONS = 2  # Reduced from 3 - over-repair causes regression
 
 
 # =============================================================================
-# STAGE 1: SHARDER NODE
+# NODE: ADAPT
 # =============================================================================
 
-@traceable(name="stage1_sharder")
-async def sharder_node(state: PipelineState) -> PipelineState:
+@traceable(name="node_adapt", run_type="chain")
+async def node_adapt(state: PipelineState) -> PipelineState:
     """
-    Stage 1: Split JSON into independent shards.
+    Adaptation node - transforms JSON to target scenario using Gemini.
 
-    - Extracts scenario options
-    - Creates Shard objects for each section
-    - Marks locked shards
-    - Computes hashes for change detection
+    Uses simple_adapter.adapt_simple() which:
+    1. Generates entity_map + domain_profile in one LLM call
+    2. Adapts all shards in parallel
+    3. Merges back to full JSON
+    4. **NEW**: Regenerates any truncated resources with GPT + full context
     """
+    from src.stages.simple_adapter import adapt_simple
+
+    logger.info("[NODE] ========== ADAPT ==========")
     start_time = time.time()
-    state["current_stage"] = "sharder"
 
     try:
-        from ..stages import Sharder, shard_json
-        from ..models.shard import ShardCollection, LockState
+        result = await adapt_simple(
+            input_json=state["input_json"],
+            scenario_prompt=state["scenario_prompt"]
+        )
 
-        # CRITICAL: Sanitize input JSON to remove surrogate characters
-        # This prevents UTF-8 encoding errors when sending to LLM APIs
-        input_json = sanitize_json_content(state["input_json"])
-        state["input_json"] = input_json  # Update state with sanitized version
-
-        selected_scenario = state["selected_scenario"]
-
-        # Shard the JSON - returns ShardCollection
-        shard_collection = shard_json(input_json)
-
-        # Extract scenario info
-        topic_data = input_json.get("topicWizardData", {})
-        scenario_options = topic_data.get("scenarioOptions", [])
-
-        # Resolve selected scenario
-        if isinstance(selected_scenario, int):
-            if selected_scenario < len(scenario_options):
-                target_scenario_text = scenario_options[selected_scenario]
-            else:
-                target_scenario_text = str(selected_scenario)
-        else:
-            target_scenario_text = str(selected_scenario)
-
-        # Track shard info from the collection (with defensive checks)
-        shard_ids = [s.id for s in shard_collection.shards if hasattr(s, 'id')]
-        locked_shard_ids = [s.id for s in shard_collection.shards if hasattr(s, 'id') and hasattr(s, 'lock_state') and s.lock_state == LockState.FULLY_LOCKED]
-        shard_hashes = {s.id: s.current_hash for s in shard_collection.shards if hasattr(s, 'id') and hasattr(s, 'current_hash')}
-
-        # Store the collection (for merge_shards later) and shards list
-        state["shard_collection"] = shard_collection
-        state["shards"] = shard_collection.shards  # List of Shard objects
-        state["shard_ids"] = shard_ids
-        state["locked_shard_ids"] = locked_shard_ids
-        state["shard_hashes"] = shard_hashes
-        state["target_scenario_text"] = target_scenario_text
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "sharder", duration_ms)
-
-        logger.info(f"Stage 1 complete: {len(shard_collection.shards)} shards, {len(locked_shard_ids)} locked")
-
-    except Exception as e:
-        logger.error(f"Sharder failed: {e}")
-        add_error(state, "sharder", str(e), is_fatal=True)
-
-    return state
-
-
-# =============================================================================
-# STAGE 2: ADAPTATION ENGINE NODE
-# =============================================================================
-
-@traceable(name="stage2_adaptation")
-async def adaptation_node(state: PipelineState) -> PipelineState:
-    """
-    Stage 2: Adapt shards to target scenario using Gemini 2.5 Flash.
-
-    Uses AdaptationEngine.adapt() which handles:
-    - Global factsheet extraction
-    - Parallel shard adaptation
-    - Entity mapping
-    """
-    start_time = time.time()
-    state["current_stage"] = "adaptation"
-
-    try:
-        from ..stages import AdaptationEngine
-        from ..rag import get_industry_context, detect_industry
-
-        input_json = state["input_json"]
-        selected_scenario = state["selected_scenario"]
-        target_scenario_text = state["target_scenario_text"]
-
-        # ⭐ DON'T pre-detect industry - let the LLM extract it from factsheet
-        # The factsheet extraction reads the scenario directly and gets correct industry
-        state["industry"] = "unknown"  # Will be updated after factsheet extraction
-
-        # Initialize adaptation engine WITHOUT RAG context
-        # (RAG context will be built AFTER we have correct industry from factsheet)
-        engine = AdaptationEngine(rag_context="")
-
-        # Determine if we're using index or free-form prompt
-        if isinstance(selected_scenario, int):
-            # Option A: Select from existing scenario options by index
-            result = await engine.adapt(
-                input_json=input_json,
-                target_scenario_index=selected_scenario,
-            )
-        else:
-            # Option B: Free-form scenario prompt
-            result = await engine.adapt(
-                input_json=input_json,
-                scenario_prompt=str(selected_scenario),
-            )
-
-        # Extract results from AdaptationResult
+        state["adapted_json"] = result.adapted_json
         state["entity_map"] = result.entity_map
-        state["global_factsheet"] = result.global_factsheet
+        state["domain_profile"] = result.domain_profile
+        state["adaptation_time_ms"] = result.time_ms
+        state["shards_processed"] = result.shards_processed
 
-        # ⭐ USE INDUSTRY FROM FACTSHEET (LLM-extracted, accurate)
-        factsheet_industry = result.global_factsheet.get("company", {}).get("industry", "")
-        if factsheet_industry and factsheet_industry.lower() != "unknown":
-            state["industry"] = factsheet_industry.lower()
-        logger.info(f"Industry from factsheet: {state['industry']}")
+        if result.errors:
+            state["errors"].extend(result.errors)
 
-        # ⭐ NOW build RAG context with CORRECT industry (for downstream validation/fixing)
-        try:
-            rag_context = get_industry_context(state["industry"])
-            state["rag_context"] = {
-                "industry": state["industry"],
-                "kpis": rag_context.kpis,
-                "terminology": rag_context.terminology[:20],
-            }
-            logger.info(f"Built RAG context for {state['industry']}: {len(rag_context.kpis)} KPIs")
-        except Exception as e:
-            logger.warning(f"RAG context failed: {e}")
-            state["rag_context"] = {"industry": state["industry"]}
+        logger.info(f"[NODE] Adapt complete: {result.shards_processed} shards, {result.time_ms}ms")
 
-        # ⭐ KLO ALIGNMENT FIX - Ensure questions map to KLOs
-        # This runs AFTER adaptation but BEFORE alignment checking
-        try:
-            from ..stages.fixers import fix_klo_alignment
-            logger.info("Running KLO Alignment Fixer...")
-            klo_fix_context = {
-                "global_factsheet": result.global_factsheet,
-            }
-            fixed_json = await fix_klo_alignment(result.adapted_json, klo_fix_context)
-            logger.info("KLO Alignment Fixer complete")
-        except Exception as e:
-            logger.warning(f"KLO Alignment Fixer failed, using original: {e}")
-            fixed_json = result.adapted_json
-
-        # Sanitize JSON to remove invalid UTF-8 surrogates before re-sharding
-        from ..utils.gemini_client import sanitize_for_json
-        fixed_json = sanitize_for_json(fixed_json)
-
-        # Update shard collection with adapted data
-        # The adaptation engine returns the merged JSON - we need to re-shard
-        # to get adapted_shards for downstream stages
-        from ..stages import shard_json
-        adapted_collection = shard_json(fixed_json)
-        state["adapted_shards"] = adapted_collection.shards
-        state["shard_collection"] = adapted_collection
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "adaptation", duration_ms)
-
-        logger.info(f"Stage 2 complete: {result.shards_adapted} shards adapted, "
-                   f"{result.shards_locked} locked, {len(result.entity_map)} entity mappings")
+        # === NEW: Check and regenerate truncated resources ===
+        adapted_json = state["adapted_json"]
+        if adapted_json:
+            regenerated = await _regenerate_short_resources(
+                adapted_json,
+                state["scenario_prompt"],
+                state["entity_map"],
+                state["domain_profile"]
+            )
+            state["adapted_json"] = regenerated
 
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        logger.error(f"Adaptation failed: {e}\n{tb}")
-        add_error(state, "adaptation", f"{str(e)}\n\nTraceback:\n{tb}", is_fatal=True)
+        logger.error(f"[NODE] Adapt failed: {e}")
+        state["errors"].append(f"Adaptation error: {str(e)}")
+        state["adapted_json"] = state["input_json"]  # Fallback
+        state["status"] = "failed"
 
+    state["stage_timings"]["adapt"] = int((time.time() - start_time) * 1000)
     return state
 
 
-# =============================================================================
-# STAGE 3: ALIGNMENT CHECKER NODE
-# =============================================================================
-
-@traceable(name="stage3_alignment")
-async def alignment_node(state: PipelineState) -> PipelineState:
+async def _regenerate_short_resources(
+    adapted_json: dict,
+    scenario_prompt: str,
+    entity_map: dict,
+    domain_profile: dict,
+    min_words: int = 500
+) -> dict:
     """
-    Stage 3: Check cross-shard alignment using GPT.
+    Find and regenerate any MAIN resources with < min_words using GPT with full context.
 
-    - Runs 9 alignment checkers in parallel
-    - Validates consistency across shards
-    - AUTO-REGENERATES failed shards and re-checks (up to 2 attempts)
+    IMPORTANT: Only regenerates MAIN resources (markdown_text/content).
+    SKIPS resource_options because they are METADATA (supposed to be 50-100 words).
+
+    This runs AFTER Gemini adaptation but BEFORE validation.
+    Uses GPT because it follows word count instructions better than Gemini.
     """
-    start_time = time.time()
-    state["current_stage"] = "alignment"
+    import copy
+    from src.stages.simple_validators import _call_gpt_async
 
-    max_regenerations = 2  # Limit regeneration attempts
-    regeneration_attempt = state.get("regeneration_attempt", 0)
+    result = copy.deepcopy(adapted_json)
 
-    try:
-        from ..stages import AlignmentChecker, check_alignment
-        from ..stages.sharder import merge_shards
+    # Find MAIN resources only (skip resource_options - they're metadata)
+    resource_paths = []
+    sim_flow = result.get("simulation_flow", result.get("simulationFlow", []))
 
-        adapted_shards = state["adapted_shards"]
-        global_factsheet = state["global_factsheet"]
-        shard_collection = state.get("shard_collection")
-        original_json = state.get("input_json", {})
+    for i, stage in enumerate(sim_flow):
+        if not isinstance(stage, dict):
+            continue
+        data = stage.get("data", {})
+        if not isinstance(data, dict):
+            continue
 
-        # SINGLE-PASS ALIGNMENT CHECK (retries handled by alignment_fixer_node)
-        # Reconstruct adapted JSON for alignment check
-        if shard_collection:
-            adapted_json = merge_shards(shard_collection, original_json)
-        else:
-            adapted_json = original_json.copy()
+        # ONLY check main resources - NOT resource_options
+        if "resource" in data and data["resource"]:
+            resource_paths.append((f"simulation_flow/{i}/data/resource", data["resource"]))
 
-        logger.info("Running alignment check (single pass - retries via alignment_fixer)...")
+        # SKIP resource_options - they are METADATA (supposed to be short ~50-100 words)
+        # DO NOT regenerate them
 
-        # Run alignment check ONCE
-        checker = AlignmentChecker()
-        alignment_report = await checker.check(
-            adapted_json=adapted_json,
-            global_factsheet=global_factsheet,
-            source_scenario=global_factsheet.get("source_scenario", ""),
+    logger.info(f"[RESOURCE REGEN] Found {len(resource_paths)} MAIN resources to check (skipping resource_options)")
+
+    # Check each resource
+    regenerated_count = 0
+    for path, resource in resource_paths:
+        if not isinstance(resource, dict):
+            continue
+
+        # Get content - check all possible keys including markdown_text
+        content = (
+            resource.get("markdown_text") or  # Primary key in input data
+            resource.get("content") or
+            resource.get("html") or
+            resource.get("text") or
+            resource.get("body") or
+            ""
         )
 
-        state["alignment_report"] = alignment_report.to_dict()
-        state["alignment_score"] = alignment_report.overall_score
-        state["alignment_passed"] = alignment_report.passed
+        if not content:
+            continue
 
-        logger.info(f"Alignment score: {alignment_report.overall_score:.2%}, passed={alignment_report.passed}")
+        word_count = len(str(content).split())
 
-        if alignment_report.passed or alignment_report.overall_score >= 0.95:
-            logger.info(f"[OK] Alignment passed ({alignment_report.overall_score:.2%})")
-        else:
-            logger.info(f"[WARN] Alignment below 95% - will route to alignment_fixer")
+        if word_count < min_words:
+            logger.info(f"[RESOURCE REGEN] {path}: {word_count} words < {min_words}, regenerating...")
 
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "alignment", duration_ms)
+            # Build context from adaptation
+            company_name = entity_map.get("company", {}).get("name", "the company") if entity_map else "the company"
+            terminology = domain_profile.get("terminology_map", {}) if domain_profile else {}
+            forbidden = domain_profile.get("forbidden_terms", []) if domain_profile else []
 
-        logger.info(f"Stage 3 complete: final alignment score {state['alignment_score']:.2%}, attempts={regeneration_attempt + 1}")
+            # Build regeneration prompt with FULL CONTEXT
+            prompt = f"""Regenerate this resource content for a business simulation.
 
-    except Exception as e:
-        logger.error(f"Alignment check failed: {e}")
-        add_error(state, "alignment", str(e), is_fatal=False)
-        # Don't override alignment_passed if we already have a valid score
-        if "alignment_score" not in state or state["alignment_score"] == 0:
-            state["alignment_passed"] = True  # Only default to True if no score yet
+## SCENARIO:
+{scenario_prompt}
 
-    return state
+## COMPANY NAME TO USE:
+{company_name}
+
+## TERMINOLOGY TO USE (source → target):
+{json.dumps(dict(list(terminology.items())[:30]), indent=2) if terminology else "Use scenario-appropriate terms"}
+
+## TERMS TO AVOID (from source scenario):
+{', '.join(forbidden[:40]) if forbidden else "None specified"}
+
+## CURRENT CONTENT (too short at {word_count} words):
+{content[:3000]}
+
+## REQUIREMENTS:
+1. Generate 800-1200 words of FACTUAL DATA
+2. Include specific numbers, percentages, statistics
+3. Use tables and structured data where appropriate
+4. NO recommendations or conclusions - just DATA
+5. NO "should", "recommend", "therefore", "suggests"
+6. Use the company name "{company_name}" consistently
+7. Avoid ALL terms from the forbidden list
+
+## OUTPUT:
+Return ONLY the regenerated content text (no JSON wrapper, no explanation)."""
+
+            try:
+                new_content = await _call_gpt_async(
+                    prompt,
+                    system="You are a business data writer. Generate factual resource content with statistics and data. Never give recommendations."
+                )
+
+                # Clean response
+                new_content = new_content.strip()
+                if new_content.startswith("```"):
+                    lines = new_content.split("\n")[1:]
+                    if lines and lines[-1].strip() == "```":
+                        lines = lines[:-1]
+                    new_content = "\n".join(lines)
+
+                new_word_count = len(new_content.split())
+                logger.info(f"[RESOURCE REGEN] {path}: {word_count} → {new_word_count} words")
+
+                # Update the resource
+                # Navigate to the path and update
+                parts = path.split("/")
+                obj = result
+                for part in parts[:-1]:
+                    if part.isdigit():
+                        obj = obj[int(part)]
+                    else:
+                        obj = obj.get(part, obj.get(part.replace("_", ""), {}))
+
+                last_part = parts[-1]
+                if last_part.isdigit():
+                    target = obj[int(last_part)]
+                else:
+                    target = obj.get(last_part, {})
+
+                if isinstance(target, dict):
+                    # Update the content field
+                    if "content" in target:
+                        target["content"] = new_content
+                    elif "html" in target:
+                        target["html"] = new_content
+                    elif "text" in target:
+                        target["text"] = new_content
+                    elif "body" in target:
+                        target["body"] = new_content
+                    else:
+                        target["content"] = new_content
+
+                    regenerated_count += 1
+
+            except Exception as e:
+                logger.error(f"[RESOURCE REGEN] Failed for {path}: {e}")
+
+    logger.info(f"[RESOURCE REGEN] Regenerated {regenerated_count}/{len(resource_paths)} resources")
+    return result
 
 
 # =============================================================================
-# STAGE 3B: ALIGNMENT FIXER NODE (NEW!)
+# NODE: VALIDATE
 # =============================================================================
 
-@traceable(name="stage3b_alignment_fixer")
-async def alignment_fixer_node(state: PipelineState) -> PipelineState:
+@traceable(name="node_validate", run_type="chain")
+async def node_validate(state: PipelineState) -> PipelineState:
     """
-    Stage 3B: Fix alignment issues BEFORE validation.
+    Validation node - runs 6 validators in parallel.
 
-    This is the KEY FIX for the alignment score problem:
-    - Old flow: alignment -> validation -> fixers (which fix VALIDATION issues)
-    - New flow: alignment -> alignment_fixer -> validation -> fixers
-
-    The alignment_fixer specifically targets ALIGNMENT issues:
-    - KLO-Question mapping
-    - KLO-Resource support
-    - Scenario coherence
-    - Role-Task alignment
-
-    Only runs if alignment score < 98%.
+    Validators:
+    1. Domain Fidelity - correct industry terminology
+    2. Context Fidelity - goal/challenge preserved
+    3. Resource Quality - data not answers, word count
+    4. KLO-Question Alignment - questions map to KLOs
+    5. Consistency - names/companies consistent
+    6. Completeness - no missing content
     """
+    from src.stages.simple_validators import run_all_validators
+
+    logger.info("[NODE] ========== VALIDATE ==========")
     start_time = time.time()
-    state["current_stage"] = "alignment_fixer"
 
     try:
-        from ..stages.alignment_fixer import AlignmentFixer, fix_alignment_issues
-        from ..stages.sharder import merge_shards
+        json_to_validate = state.get("adapted_json") or state["input_json"]
 
-        alignment_score = state.get("alignment_score", 0)
-        alignment_report = state.get("alignment_report", {})
-
-        # Skip if already passing
-        if alignment_score >= 0.95:
-            logger.info(f"Alignment score {alignment_score:.2%} >= 95%, skipping alignment fixer")
-            state["alignment_fixer_skipped"] = True
-            return state
-
-        # Get adapted JSON (merged from shards)
-        shard_collection = state.get("shard_collection")
-        input_json = state.get("input_json", {})
-
-        if shard_collection:
-            adapted_json = merge_shards(shard_collection, input_json)
-        else:
-            adapted_json = input_json.copy()
-
-        global_factsheet = state.get("global_factsheet", {})
-
-        current_retry = state.get("alignment_retry_count", 0)
-        logger.info(f"Running AlignmentFixer (score: {alignment_score:.2%}, retry: {current_retry})")
-
-        # Run alignment fixer
-        fixer = AlignmentFixer()
-        fixed_json, fix_results = await fixer.fix(
-            adapted_json=adapted_json,
-            alignment_report=alignment_report,
-            global_factsheet=global_factsheet,
+        report = await run_all_validators(
+            adapted_json=json_to_validate,
+            scenario_prompt=state["scenario_prompt"]
         )
 
-        # Store fix results
-        state["alignment_fix_results"] = [r.to_dict() for r in fix_results]
-        total_fixes = sum(len(r.changes_made) for r in fix_results)
-        state["alignment_fixes_applied"] = total_fixes
+        state["validation_score"] = report.overall_score
+        state["validation_passed"] = report.passed
+        state["validation_issues"] = []
+        state["agent_scores"] = {}
 
-        # Debug: show what fixes were applied
-        for r in fix_results:
-            print(f"[ALIGNMENT DEBUG] Rule {r.rule_id}: changes_made={r.changes_made[:3] if r.changes_made else []}")
+        # Collect issues and scores
+        for agent_result in report.agent_results:
+            state["agent_scores"][agent_result.agent_name] = agent_result.score
+            for issue in agent_result.issues:
+                state["validation_issues"].append({
+                    "agent": issue.agent,
+                    "location": issue.location,
+                    "issue": issue.issue,
+                    "suggestion": issue.suggestion,
+                    "severity": issue.severity
+                })
 
-        # Re-shard the fixed JSON for downstream stages
-        from ..stages import shard_json
-        fixed_collection = shard_json(fixed_json)
-        state["adapted_shards"] = fixed_collection.shards
-        state["shard_collection"] = fixed_collection
-
-        # Track score before fix for logging
-        state["previous_alignment_score"] = alignment_score
-
-        # INCREMENT RETRY COUNTER HERE (not in routing function!)
-        # This ensures the counter is updated before the next routing decision
-        state["alignment_retry_count"] = current_retry + 1
-        logger.info(f"Incremented alignment_retry_count to {current_retry + 1}")
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "alignment_fixer", duration_ms)
-
-        logger.info(f"Stage 3B complete: {total_fixes} alignment fixes applied, retry count now {current_retry + 1}")
+        logger.info(f"[NODE] Validate: {report.overall_score:.2%}, {len(state['validation_issues'])} issues")
+        for name, score in state["agent_scores"].items():
+            status = "[OK]" if score >= PASS_THRESHOLD else "[!!]"
+            logger.info(f"[NODE]   {status} {name}: {score:.2%}")
 
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
-        logger.error(f"Alignment fixer failed: {e}\n{tb}")
-        add_error(state, "alignment_fixer", str(e), is_fatal=False)
-        # Continue with unfixed shards
-        state["alignment_fixer_skipped"] = True
-
-    return state
-
-
-# =============================================================================
-# STAGE 4: SCOPED VALIDATION NODE
-# =============================================================================
-
-@traceable(name="stage4_validation")
-async def validation_node(state: PipelineState) -> PipelineState:
-    """
-    Stage 4: Validate each shard independently (parallel).
-
-    - Runs all validators in parallel per shard
-    - Collects issues by severity
-    - Reports pass/fail per shard
-    """
-    start_time = time.time()
-    state["current_stage"] = "validation"
-
-    try:
-        from ..validators import ScopedValidator, validate_shards
-
-        shards = state.get("fixed_shards") or state["adapted_shards"]
-        global_factsheet = state["global_factsheet"]
-
-        # Get original shards for comparison (to detect NEWLY empty fields)
-        original_shards = state.get("shards", [])
-        base_shards_map = {s.id: s for s in original_shards if hasattr(s, 'id')}
-
-        # Build validation context
-        context = {
-            "global_factsheet": global_factsheet,
-            "industry": state["industry"],
-            "source_scenario": global_factsheet.get("source_scenario", ""),
-            "entity_map": state["entity_map"],
-            "base_shards": base_shards_map,  # For comparing with original
-        }
-
-        # Run scoped validation
-        validator = ScopedValidator()
-        validation_report, validation_fixes = await validator.validate_all(shards, context)
-
-        state["validation_report"] = validation_report.to_dict()
-        state["validation_score"] = validation_report.overall_score
-        state["validation_passed"] = validation_report.passed
-        state["blocker_count"] = validation_report.blocker_count
-        state["warning_count"] = validation_report.warning_count
-        state["validation_fixes"] = validation_fixes  # Store fixes for fixer stage
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "validation", duration_ms)
-
-        logger.info(
-            f"Stage 4 complete: score {validation_report.overall_score:.2%}, "
-            f"blockers={validation_report.blocker_count}, warnings={validation_report.warning_count}"
-        )
-
-    except Exception as e:
-        logger.error(f"Validation failed: {e}")
-        add_error(state, "validation", str(e), is_fatal=False)
+        logger.error(f"[NODE] Validate failed: {e}")
+        state["errors"].append(f"Validation error: {str(e)}")
+        state["validation_score"] = 0.0
         state["validation_passed"] = False
 
+    state["stage_timings"]["validate"] = int((time.time() - start_time) * 1000)
     return state
 
 
 # =============================================================================
-# STAGE 4B: FIXERS NODE
+# NODE: REPAIR
 # =============================================================================
 
-@traceable(name="stage4b_fixers")
-async def fixers_node(state: PipelineState) -> PipelineState:
+@traceable(name="node_repair", run_type="chain")
+async def node_repair(state: PipelineState) -> PipelineState:
     """
-    Stage 4B: Fix failing shards using hybrid approach.
+    Repair node - fixes issues found by validators.
 
-    - LLM identifies exact fields (JSON Pointer paths)
-    - Patcher applies surgical 'replace' operations
-    - Stores patches for rollback
+    Two repair strategies:
+    1. Resource Fixer - regenerates content (for word count, direct answers)
+    2. Generic Patcher - find/replace patches (for domain terms, consistency)
     """
+    from src.stages.simple_validators import (
+        fix_resource_quality,
+        fix_context_fidelity,
+        fix_completeness,
+        repair_issues,
+        ValidationReport,
+        AgentResult,
+        ValidationIssue
+    )
+
+    iteration = state.get("repair_iteration", 0) + 1
+    state["repair_iteration"] = iteration
+
+    logger.info(f"[NODE] ========== REPAIR (iter {iteration}/{MAX_REPAIR_ITERATIONS}) ==========")
     start_time = time.time()
-    state["current_stage"] = "fixers"
 
     try:
-        from ..stages import ScopedFixer, fix_all_shards
-        from ..validators import ScopedValidationReport
+        current_json = state.get("adapted_json") or state["input_json"]
+        issues = state.get("validation_issues", [])
 
-        shards = state.get("fixed_shards") or state["adapted_shards"]
-        validation_report = state.get("validation_report", {})
-
-        # Skip if no issues
-        if state.get("validation_passed", False):
-            state["fixed_shards"] = shards
-            state["fix_results"] = {}
-            add_stage_timing(state, "fixers", int((time.time() - start_time) * 1000))
+        if not issues:
+            logger.info("[NODE] No issues to repair")
+            state["stage_timings"]["repair"] = int((time.time() - start_time) * 1000)
             return state
 
-        # Build fix context - include BOTH validation AND alignment issues
-        alignment_report = state.get("alignment_report", {})
-        alignment_feedback = state.get("alignment_feedback", {})
+        # Convert dict issues back to ValidationIssue objects
+        validation_issues = []
+        for issue_dict in issues:
+            validation_issues.append(ValidationIssue(
+                agent=issue_dict["agent"],
+                location=issue_dict["location"],
+                issue=issue_dict["issue"],
+                suggestion=issue_dict["suggestion"],
+                severity=issue_dict.get("severity", "warning")
+            ))
 
-        context = {
-            "global_factsheet": state["global_factsheet"],
-            "industry": state["industry"],
-            "entity_map": state["entity_map"],
-            # Add alignment context for fixers
-            "alignment_report": alignment_report,
-            "alignment_feedback": alignment_feedback,
-            "alignment_score": state.get("alignment_score", 0),
-        }
+        # STEP 1: Fix Resource Quality issues (regeneration) - NOW WITH CONTEXT
+        resource_issues = [i for i in validation_issues if i.agent == "Resource Quality"]
+        if resource_issues:
+            logger.info(f"[NODE] Fixing {len(resource_issues)} resource issues (regeneration with context)")
+            current_json = await fix_resource_quality(
+                current_json,
+                state["scenario_prompt"],
+                resource_issues,
+                entity_map=state.get("entity_map", {}),
+                domain_profile=state.get("domain_profile", {})
+            )
 
-        print(f"[FIXER] Context includes alignment_score={context['alignment_score']:.2%}")
+        # STEP 2: Fix Context Fidelity issues (specialized)
+        context_issues = [i for i in validation_issues if i.agent == "Context Fidelity"]
+        if context_issues:
+            logger.info(f"[NODE] Fixing {len(context_issues)} context fidelity issues")
+            current_json = await fix_context_fidelity(
+                current_json,
+                state["scenario_prompt"],
+                context_issues
+            )
 
-        # Create validation report object for fixer
-        class MockValidationReport:
-            def __init__(self, report_dict):
-                self.shard_results = {}
-                for shard_id, results in report_dict.get("shards", {}).items():
-                    self.shard_results[shard_id] = results
+        # STEP 3: Fix Completeness issues (specialized)
+        completeness_issues = [i for i in validation_issues if i.agent == "Completeness"]
+        if completeness_issues:
+            logger.info(f"[NODE] Fixing {len(completeness_issues)} completeness issues")
+            current_json = await fix_completeness(
+                current_json,
+                state["scenario_prompt"],
+                completeness_issues
+            )
 
-        mock_report = MockValidationReport(validation_report)
+        # STEP 4: Fix other issues (patching)
+        other_issues = [i for i in validation_issues if i.agent not in ("Resource Quality", "Context Fidelity", "Completeness")]
+        if other_issues:
+            logger.info(f"[NODE] Fixing {len(other_issues)} other issues (patching)")
 
-        # Run fixers
-        fixer = ScopedFixer()
-        fix_results = await fixer.fix_all(shards, mock_report, context)
+            mini_report = ValidationReport(
+                overall_score=state["validation_score"],
+                passed=False,
+                agent_results=[
+                    AgentResult(
+                        agent_name="Mixed",
+                        score=0.0,
+                        passed=False,
+                        issues=other_issues
+                    )
+                ],
+                total_issues=len(other_issues),
+                needs_repair=True
+            )
+            current_json = await repair_issues(
+                current_json,
+                state["scenario_prompt"],
+                mini_report
+            )
 
-        # Update shards with fixed content
-        fixed_shards = []
-        all_patches = []
+        state["adapted_json"] = current_json
 
-        for shard in shards:
-            shard_id = shard.id if hasattr(shard, 'id') else "unknown"
+        # Track repair history
+        state["repair_history"].append({
+            "iteration": iteration,
+            "issues_count": len(issues),
+            "previous_score": state["validation_score"]
+        })
 
-            if shard_id in fix_results:
-                result = fix_results[shard_id]
-                if result.success and result.fixed_content:
-                    shard.content = result.fixed_content
-                    all_patches.extend([p.to_dict() for p in result.patches_applied])
-
-            fixed_shards.append(shard)
-
-        state["fixed_shards"] = fixed_shards
-        state["fix_results"] = {sid: r.to_dict() for sid, r in fix_results.items()}
-        state["patches_applied"] = all_patches
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "fixers", duration_ms)
-
-        logger.info(f"Stage 4B complete: {len(fix_results)} shards processed, {len(all_patches)} patches applied")
+        logger.info(f"[NODE] Repair iteration {iteration} complete")
 
     except Exception as e:
-        logger.error(f"Fixers failed: {e}")
-        add_error(state, "fixers", str(e), is_fatal=False)
-        state["fixed_shards"] = state.get("adapted_shards", [])
+        logger.error(f"[NODE] Repair failed: {e}")
+        state["errors"].append(f"Repair error (iter {iteration}): {str(e)}")
 
+    state["stage_timings"]["repair"] = int((time.time() - start_time) * 1000)
     return state
 
 
 # =============================================================================
-# STAGE 5: MERGER NODE
+# NODE: FINALIZE
 # =============================================================================
 
-@traceable(name="stage5_merger")
-async def merger_node(state: PipelineState) -> PipelineState:
-    """
-    Stage 5: Reassemble shards into full JSON.
+@traceable(name="node_finalize", run_type="chain")
+async def node_finalize(state: PipelineState) -> PipelineState:
+    """Finalize node - set final output and status."""
 
-    - Merges all shards back together
-    - Preserves original structure
-    """
-    start_time = time.time()
-    state["current_stage"] = "merger"
+    logger.info("[NODE] ========== FINALIZE ==========")
 
-    try:
-        from ..stages import merge_shards
-        from ..models.shard import ShardCollection
+    state["final_json"] = state.get("adapted_json") or state["input_json"]
+    state["final_score"] = state.get("validation_score", 0.0)
 
-        shards = state.get("fixed_shards") or state.get("adapted_shards") or state["shards"]
-        input_json = state["input_json"]
+    if state["final_score"] >= PASS_THRESHOLD:
+        state["status"] = "success"
+        logger.info(f"[NODE] SUCCESS: {state['final_score']:.2%}")
+    elif state["final_score"] >= 0.80:
+        state["status"] = "partial"
+        logger.info(f"[NODE] PARTIAL: {state['final_score']:.2%} (below {PASS_THRESHOLD:.0%})")
+    else:
+        state["status"] = "failed"
+        logger.info(f"[NODE] FAILED: {state['final_score']:.2%}")
 
-        # Get or create ShardCollection for merge
-        shard_collection = state.get("shard_collection")
-        if shard_collection is None:
-            # Create a new collection from shards list
-            shard_collection = ShardCollection(
-                shards=shards,
-                source_json_hash="",
-                scenario_prompt=state.get("target_scenario_text", ""),
-            )
-        else:
-            # Update collection's shards with fixed shards
-            shard_collection.shards = shards
-
-        # Merge shards back into full JSON
-        merged_json = merge_shards(shard_collection, input_json)
-
-        # Post-processing cleanup (trailing dots, template braces, etc.)
-        from ..stages.sharder import cleanup_merged_json
-        merged_json = cleanup_merged_json(merged_json)
-
-        state["merged_json"] = merged_json
-        state["merge_successful"] = True
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "merger", duration_ms)
-
-        logger.info("Stage 5 complete: shards merged")
-
-    except Exception as e:
-        logger.error(f"Merger failed: {e}")
-        add_error(state, "merger", str(e), is_fatal=True)
-        state["merge_successful"] = False
-
-    return state
-
-
-# =============================================================================
-# STAGE 6: FINISHER NODE
-# =============================================================================
-
-@traceable(name="stage6_finisher")
-async def finisher_node(state: PipelineState) -> PipelineState:
-    """
-    Stage 6: Run compliance loop.
-
-    - Re-validates changed shards
-    - Computes weighted compliance score
-    - Routes back to fixers if needed (max 3 iterations)
-    - Flags for human if still failing
-    """
-    start_time = time.time()
-    state["current_stage"] = "finisher"
-
-    try:
-        from ..stages import Finisher, ComplianceStatus
-
-        shards = state.get("fixed_shards") or state["adapted_shards"]
-
-        # Build context for compliance check
-        context = {
-            "global_factsheet": state["global_factsheet"],
-            "industry": state["industry"],
-            "adapted_json": state["merged_json"],
-            "source_scenario": state["global_factsheet"].get("source_scenario", ""),
-        }
-
-        # Run compliance check - use max_iterations=1 to avoid re-running validation
-        # We already have validation results from the validation node
-        finisher = Finisher(max_iterations=1)
-
-        # Pass existing validation report to avoid re-running validation
-        existing_validation = state.get("validation_report")
-        compliance_result = await finisher.run_compliance_loop(
-            shards, context, existing_validation_report=existing_validation
-        )
-
-        state["compliance_result"] = compliance_result.to_dict()
-        state["compliance_score"] = compliance_result.score.overall_score
-        state["compliance_passed"] = compliance_result.status == ComplianceStatus.PASS
-        state["compliance_iteration"] = compliance_result.iteration
-        state["flagged_for_human"] = compliance_result.flagged_for_human
-
-        # Update fixed shards if compliance loop modified them
-        state["fixed_shards"] = shards
-
-        # INCREMENT RETRY COUNT HERE (not in routing function!)
-        # Routing functions are read-only in LangGraph
-        if not state["compliance_passed"]:
-            state["retry_count"] = state.get("retry_count", 0) + 1
-
-        # Generate human-readable validation report using FAST PATH
-        # This avoids re-running all validation checks - uses existing results
-        try:
-            from ..validation import format_markdown_report
-            from ..validation.report_generator import ValidationReportGenerator
-
-            factsheet = state["global_factsheet"]
-
-            # Use FAST PATH: Build report directly from existing results
-            # This skips re-running all validation checks (saves ~100-200s latency)
-            report_gen = ValidationReportGenerator(
-                original_scenario=factsheet.get("source_scenario", "Source Simulation"),
-                target_scenario=factsheet.get("target_scenario", "Target Simulation"),
-                simulation_purpose=factsheet.get("simulation_purpose", "Training Simulation"),
-                system_mode="Fully automated",
-                acceptance_threshold=0.95,
-            )
-
-            # Build report from existing pipeline results (no re-validation!)
-            report_data = report_gen.from_existing_results(
-                validation_report=state.get("validation_report", {}),
-                alignment_report=state.get("alignment_report", {}),
-                compliance_result=state.get("compliance_result", {}),
-                factsheet=factsheet,
-            )
-            human_readable_report = format_markdown_report(report_data)
-            state["human_readable_report"] = human_readable_report
-
-            logger.info(f"Generated human-readable validation report ({len(human_readable_report)} chars) [FAST PATH]")
-
-        except Exception as report_err:
-            logger.warning(f"Could not generate human-readable report: {report_err}")
-            state["human_readable_report"] = f"Report generation failed: {report_err}"
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "finisher", duration_ms)
-
-        logger.info(
-            f"Stage 6 complete: compliance {compliance_result.status.value}, "
-            f"score {compliance_result.score.overall_score:.2%}, "
-            f"iterations={compliance_result.iteration}"
-        )
-
-    except Exception as e:
-        logger.error(f"Finisher failed: {e}")
-        add_error(state, "finisher", str(e), is_fatal=False)
-        state["compliance_passed"] = False
-
-    return state
-
-
-# =============================================================================
-# STAGE 7: HUMAN APPROVAL NODE
-# =============================================================================
-
-@traceable(name="stage7_human_approval")
-async def human_approval_node(state: PipelineState) -> PipelineState:
-    """
-    Stage 7: Create human approval package.
-
-    - Builds approval package with summary
-    - Sets URLs for approve/reject
-    - Marks status as pending human review
-    """
-    start_time = time.time()
-    state["current_stage"] = "human_approval"
-
-    try:
-        from ..stages import HumanApproval, create_approval
-        import uuid
-
-        simulation_id = str(uuid.uuid4())[:8]
-
-        # Create mock compliance result for approval
-        class MockComplianceResult:
-            def __init__(self, state_dict):
-                self.score = type('Score', (), {
-                    'overall_score': state_dict.get("compliance_score", 0.0),
-                    'blocker_pass_rate': 1.0 if state_dict.get("blocker_count", 0) == 0 else 0.5,
-                    'passed': state_dict.get("compliance_passed", False),
-                })()
-                self.flagged_for_human = state_dict.get("flagged_for_human", [])
-                self.iteration = state_dict.get("compliance_iteration", 1)
-
-        mock_compliance = MockComplianceResult(state)
-
-        # Build context for approval
-        context = {
-            "target_scenario": state["target_scenario_text"],
-            "global_factsheet": state["global_factsheet"],
-            "industry": state["industry"],
-        }
-
-        # Create approval package
-        approval_system = HumanApproval(base_url="")
-        approval_package = approval_system.create_approval_package(
-            simulation_id=simulation_id,
-            compliance_result=mock_compliance,
-            context=context,
-        )
-
-        state["approval_package"] = approval_package.to_dict()
-        state["approval_status"] = "pending"
-
-        # Set final output
-        state["output_json"] = state["merged_json"]
-
-        # Determine final status
-        if state.get("compliance_passed", False):
-            state["final_status"] = "OK"
-        elif state.get("flagged_for_human", []):
-            state["final_status"] = "HUMAN_REVIEW"
-        else:
-            state["final_status"] = "FAIL"
-
-        duration_ms = int((time.time() - start_time) * 1000)
-        add_stage_timing(state, "human_approval", duration_ms)
-
-        logger.info(f"Stage 7 complete: approval package created, status={state['final_status']}")
-
-    except Exception as e:
-        logger.error(f"Human approval failed: {e}")
-        add_error(state, "human_approval", str(e), is_fatal=False)
-        state["output_json"] = state.get("merged_json", {})
-        state["final_status"] = "FAIL"
+    # Calculate total runtime
+    state["total_runtime_ms"] = sum(state["stage_timings"].values())
 
     return state
 
@@ -802,310 +505,179 @@ async def human_approval_node(state: PipelineState) -> PipelineState:
 # ROUTING FUNCTIONS
 # =============================================================================
 
-def should_fix(state: PipelineState) -> str:
-    """Decide if fixers should run."""
-    if state.get("validation_passed", False):
-        return "merger"  # Skip fixers, go to merger
-    return "fixers"
+def should_repair(state: PipelineState) -> Literal["repair", "finalize"]:
+    """Decide whether to repair or finalize."""
 
+    score = state.get("validation_score", 0.0)
+    iteration = state.get("repair_iteration", 0)
 
-def should_fix_alignment(state: PipelineState) -> str:
-    """
-    Decide if alignment fixer should run. PURE FUNCTION - no state modification.
+    # Check if passed
+    if score >= PASS_THRESHOLD:
+        logger.info(f"[ROUTE] Score {score:.2%} >= {PASS_THRESHOLD:.0%} -> finalize")
+        return "finalize"
 
-    Run alignment fixer if:
-    1. Alignment score < 98%
-    2. Alignment retry count < max (2)
-    """
-    alignment_score = state.get("alignment_score", 0)
-    alignment_retry = state.get("alignment_retry_count", 0)
-    MAX_ALIGNMENT_RETRIES = 2
+    # Check max iterations (reduced to 2 to prevent over-repair)
+    if iteration >= MAX_REPAIR_ITERATIONS:
+        logger.info(f"[ROUTE] Max iterations ({MAX_REPAIR_ITERATIONS}) -> finalize")
+        return "finalize"
 
-    if alignment_score >= 0.95:
-        print(f"[ALIGNMENT ROUTE] Score {alignment_score:.2%} >= 95%, -> validation")
-        return "validation"
+    # Check if making progress - compare CURRENT score with LAST recorded score
+    # This catches actual regression (when repairs make things worse)
+    history = state.get("repair_history", [])
+    if len(history) >= 1:
+        # Last entry has the score BEFORE that repair iteration
+        last_pre_repair_score = history[-1].get("previous_score", 0)
+        # If current score is less than or equal to what we had before repairs started
+        if score <= last_pre_repair_score * 0.95:  # Allow 5% tolerance
+            logger.info(f"[ROUTE] Regression detected ({last_pre_repair_score:.2%} -> {score:.2%}) -> finalize")
+            return "finalize"
 
-    if alignment_retry >= MAX_ALIGNMENT_RETRIES:
-        print(f"[ALIGNMENT ROUTE] Max retries ({MAX_ALIGNMENT_RETRIES}) reached, -> validation")
-        return "validation"
+    # Also stop if score is "good enough" (≥ 85%) to avoid over-repair
+    if score >= 0.85:
+        logger.info(f"[ROUTE] Score {score:.2%} is acceptable (≥85%) -> finalize")
+        return "finalize"
 
-    print(f"[ALIGNMENT ROUTE] Score {alignment_score:.2%} < 95%, retry {alignment_retry}/{MAX_ALIGNMENT_RETRIES} -> alignment_fixer")
-    return "alignment_fixer"
-
-
-def should_retry_alignment(state: PipelineState) -> str:
-    """
-    Decide if alignment should be re-checked after fixing. PURE FUNCTION - no state modification.
-    State updates happen in alignment_fixer_node.
-    """
-    MAX_ALIGNMENT_RETRIES = 2
-
-    alignment_retry = state.get("alignment_retry_count", 0)
-    fixes_applied = state.get("alignment_fixes_applied", 0)
-
-    print(f"[ALIGNMENT RETRY] retry={alignment_retry}/{MAX_ALIGNMENT_RETRIES}, fixes={fixes_applied}")
-
-    # ALWAYS go to validation after alignment_fixer - no re-checking alignment
-    # (alignment re-check is wasteful and adds 27s+ latency per retry)
-    if fixes_applied > 0:
-        print(f"[ALIGNMENT RETRY] -> validation (applied {fixes_applied} fixes, skipping re-check)")
-    else:
-        print("[ALIGNMENT RETRY] -> validation (no fixes to apply)")
-    return "validation"
-
-
-def should_retry_compliance(state: PipelineState) -> str:
-    """
-    Decide if compliance loop should retry.
-
-    Retries if:
-    1. Alignment score < threshold (0.85)
-    2. Patches were applied (fixes made progress)
-    3. Retry count < max (3)
-    """
-    MAX_RETRIES = 1  # Reduced from 3 - single pass for faster completion
-
-    # Get current retry count
-    retry_count = state.get("compliance_retry_count", 0)
-
-    # Check if we should retry
-    alignment_passed = state.get("alignment_passed", False)
-    alignment_score = state.get("alignment_score", 0)
-    patches_applied = len(state.get("patches_applied", []))
-
-    print(f"[RETRY CHECK] retry={retry_count}/{MAX_RETRIES}, alignment={alignment_score:.2%}, patches={patches_applied}")
-
-    # Don't retry if already passed
-    if alignment_passed:
-        print("[RETRY CHECK] -> human_approval (alignment passed)")
-        return "human_approval"
-
-    # Don't retry if max retries reached
-    if retry_count >= MAX_RETRIES:
-        print(f"[RETRY CHECK] -> human_approval (max retries {MAX_RETRIES} reached)")
-        return "human_approval"
-
-    # Don't retry - go directly to human_approval
-    # (routing back to alignment adds 27s+ latency and rarely improves scores)
-    print("[RETRY CHECK] -> human_approval (no retry loop - reduces latency)")
-    return "human_approval"
-
-
-def should_abort(state: PipelineState) -> str:
-    """Check if pipeline should abort due to fatal error."""
-    if state.get("final_status") == "FAIL":
-        errors = state.get("errors", [])
-        fatal_errors = [e for e in errors if e.get("is_fatal", False)]
-        if fatal_errors:
-            return "abort"
-    return "continue"
+    logger.info(f"[ROUTE] Score {score:.2%} < {PASS_THRESHOLD:.0%} -> repair")
+    return "repair"
 
 
 # =============================================================================
-# WORKFLOW GRAPH CREATION
+# BUILD GRAPH
 # =============================================================================
 
-def create_adaptation_workflow():
-    """
-    Create the 7-stage LangGraph workflow with AlignmentFixer.
+def build_pipeline() -> StateGraph:
+    """Build the LangGraph pipeline."""
 
-    NEW FLOW (fixes the alignment score problem):
-    ┌─────────┐   ┌────────────┐   ┌───────────┐
-    │ Sharder │ -> │ Adaptation │ -> │ Alignment │
-    └─────────┘   └────────────┘   └─────┬─────┘
-                                         │
-                       ┌─────────────────┴─────────────────┐
-                       │ alignment_score >= 98%?           │
-                       │  Yes -> Validation                 │
-                       │  No  -> Alignment Fixer ───┐       │
-                       └───────────────────────────┼───────┘
-                                                   │
-                         ┌─────────────────────────┘
-                         │
-                         ▼
-                  ┌──────────────────┐
-                  │ Alignment Fixer  │ ← NEW! Fixes ALIGNMENT issues
-                  └────────┬─────────┘
-                           │
-              ┌────────────┴────────────┐
-              │ fixes_applied > 0?      │
-              │  Yes & retries < 2 ->    │
-              │       back to Alignment │
-              │  No -> Validation        │
-              └────────────────────────-┘
-                           │
-                           ▼
-                  ┌────────────┐
-                  │ Validation │
-                  └─────┬──────┘
-                        │
-        ┌───────────────┴───────────────┐
-        │ validation_passed?            │
-        │  Yes -> Merger                 │
-        │  No  -> Fixers -> Merger        │
-        └───────────────────────────────┘
-                        │
-                        ▼
-    ┌───────────────┐   ┌──────────┐   ┌──────────┐
-    │ Human Approval│ ← │ Finisher │ ← │  Merger  │
-    └───────────────┘   └──────────┘   └──────────┘
-           │
-           ▼
-         [END]
+    graph = StateGraph(PipelineState)
 
-    Returns:
-        Compiled StateGraph workflow
-    """
-    from langgraph.graph import StateGraph, END
+    # Add nodes
+    graph.add_node("adapt", node_adapt)
+    graph.add_node("validate", node_validate)
+    graph.add_node("repair", node_repair)
+    graph.add_node("finalize", node_finalize)
 
-    # Create workflow graph
-    workflow = StateGraph(PipelineState)
+    # Set entry point
+    graph.set_entry_point("adapt")
 
-    # ==========================================================================
-    # ADD NODES (all have @traceable for LangSmith observability)
-    # ==========================================================================
-    workflow.add_node("sharder", sharder_node)
-    workflow.add_node("adaptation", adaptation_node)
-    workflow.add_node("alignment", alignment_node)
-    workflow.add_node("alignment_fixer", alignment_fixer_node)  # NEW!
-    workflow.add_node("validation", validation_node)
-    workflow.add_node("fixers", fixers_node)
-    workflow.add_node("merger", merger_node)
-    workflow.add_node("finisher", finisher_node)
-    workflow.add_node("human_approval", human_approval_node)
+    # Add edges
+    graph.add_edge("adapt", "validate")
 
-    # ==========================================================================
-    # SET ENTRY POINT
-    # ==========================================================================
-    workflow.set_entry_point("sharder")
-
-    # ==========================================================================
-    # ADD EDGES
-    # ==========================================================================
-
-    # Stage 1 -> Stage 2
-    workflow.add_edge("sharder", "adaptation")
-
-    # Stage 2 -> Stage 3
-    workflow.add_edge("adaptation", "alignment")
-
-    # Stage 3 -> Stage 3B or Stage 4 (NEW conditional for alignment fixer)
-    workflow.add_conditional_edges(
-        "alignment",
-        should_fix_alignment,  # NEW! Decides if alignment fixer should run
+    # Conditional routing after validate
+    graph.add_conditional_edges(
+        "validate",
+        should_repair,
         {
-            "alignment_fixer": "alignment_fixer",  # Score < 98% -> fix alignment issues
-            "validation": "validation",             # Score >= 98% -> skip to validation
+            "repair": "repair",
+            "finalize": "finalize"
         }
     )
 
-    # Stage 3B -> Stage 3 (re-check) or Stage 4 (NEW conditional for retry)
-    workflow.add_conditional_edges(
-        "alignment_fixer",
-        should_retry_alignment,  # NEW! Smart retry based on improvement
-        {
-            "alignment": "alignment",      # Retry if fixes applied and under max retries
-            "validation": "validation",    # Proceed if no fixes or max retries
-        }
-    )
+    # After repair, go back to validate
+    graph.add_edge("repair", "validate")
 
-    # Stage 4 -> Stage 4B or Stage 5 (conditional)
-    workflow.add_conditional_edges(
-        "validation",
-        should_fix,
-        {
-            "fixers": "fixers",    # Has issues -> fix them (validation issues)
-            "merger": "merger",    # No issues -> skip to merger
-        }
-    )
+    # Finalize goes to END
+    graph.add_edge("finalize", END)
 
-    # Stage 4B -> Stage 5
-    workflow.add_edge("fixers", "merger")
-
-    # Stage 5 -> Stage 6
-    workflow.add_edge("merger", "finisher")
-
-    # Stage 6 -> Stage 7 (simplified - no more wasteful retry loop)
-    # The alignment loop already handles retries, so finisher goes directly to human
-    workflow.add_edge("finisher", "human_approval")
-
-    # Stage 7 -> END
-    workflow.add_edge("human_approval", END)
-
-    # ==========================================================================
-    # COMPILE
-    # ==========================================================================
-    return workflow.compile()
+    return graph.compile()
 
 
 # =============================================================================
-# RUN PIPELINE FUNCTIONS
+# MAIN ENTRY POINT
 # =============================================================================
 
-@traceable(name="run_adaptation_pipeline")
+@dataclass
+class PipelineResult:
+    """Result from running the pipeline."""
+    final_json: dict
+    final_score: float
+    status: str  # "success" | "partial" | "failed"
+    adaptation_time_ms: int
+    shards_processed: int
+    repair_iterations: int
+    agent_scores: dict
+    issues_remaining: int
+    total_runtime_ms: int
+    errors: list
+
+
+@traceable(name="run_pipeline", run_type="chain")
 async def run_pipeline(
     input_json: dict,
-    selected_scenario: str | int,
-    max_retries: int = 3,
-) -> PipelineState:
+    scenario_prompt: str
+) -> PipelineResult:
     """
-    Run the full 7-stage adaptation pipeline.
+    Run the full adaptation pipeline.
 
     Args:
-        input_json: Original simulation JSON
-        selected_scenario: Target scenario (index or text)
-        max_retries: Max compliance loop retries (default 3)
+        input_json: The simulation JSON to adapt
+        scenario_prompt: Description of the target scenario
 
     Returns:
-        Final PipelineState with results
+        PipelineResult with final JSON and metrics
     """
     from .state import create_initial_state
 
-    # Create workflow
-    workflow = create_adaptation_workflow()
+    logger.info("[PIPELINE] ========================================")
+    logger.info("[PIPELINE] STARTING ADAPTATION PIPELINE")
+    logger.info("[PIPELINE] ========================================")
+    logger.info(f"[PIPELINE] Scenario: {scenario_prompt[:100]}...")
+    logger.info(f"[PIPELINE] Input size: {len(json.dumps(input_json)):,} chars")
 
-    # Create initial state
+    # Build and run the graph
+    pipeline = build_pipeline()
+
+    # Initial state
     initial_state = create_initial_state(
         input_json=input_json,
-        selected_scenario=selected_scenario,
-        max_retries=max_retries,
+        scenario_prompt=scenario_prompt
     )
 
-    # Run workflow with recursion limit (safety net)
-    # Max nodes: sharder(1) + adapt(1) + align(1) + validation(3) + fixers(3) + merger(3) + finisher(3) + human(1) = ~16 max
-    config = {"recursion_limit": 50}
-    final_state = await workflow.ainvoke(initial_state, config=config)
+    # Run the pipeline
+    final_state = await pipeline.ainvoke(initial_state)
 
-    # Log summary
-    logger.info(
-        f"Pipeline complete: status={final_state.get('final_status')}, "
-        f"runtime={final_state.get('total_runtime_ms')}ms, "
-        f"tokens={final_state.get('total_tokens')}"
+    # Build result
+    result = PipelineResult(
+        final_json=final_state.get("final_json", {}),
+        final_score=final_state.get("final_score", 0.0),
+        status=final_state.get("status", "unknown"),
+        adaptation_time_ms=final_state.get("adaptation_time_ms", 0),
+        shards_processed=final_state.get("shards_processed", 0),
+        repair_iterations=final_state.get("repair_iteration", 0),
+        agent_scores=final_state.get("agent_scores", {}),
+        issues_remaining=len(final_state.get("validation_issues", [])),
+        total_runtime_ms=final_state.get("total_runtime_ms", 0),
+        errors=final_state.get("errors", [])
     )
 
-    return final_state
+    logger.info("[PIPELINE] ========================================")
+    logger.info(f"[PIPELINE] COMPLETE: {result.status.upper()}")
+    logger.info(f"[PIPELINE] Final Score: {result.final_score:.2%}")
+    logger.info(f"[PIPELINE] Total Time: {result.total_runtime_ms}ms")
+    logger.info(f"[PIPELINE] Repair Iterations: {result.repair_iterations}")
+    logger.info("[PIPELINE] ========================================")
 
+    return result
+
+
+# =============================================================================
+# STREAMING VERSION
+# =============================================================================
 
 async def run_pipeline_streaming(
     input_json: dict,
-    selected_scenario: str | int,
-    max_retries: int = 3,
+    scenario_prompt: str
 ):
     """
     Run pipeline with streaming state updates.
-
     Yields state after each node completes.
-    Good for progress tracking in UI.
     """
     from .state import create_initial_state
 
-    workflow = create_adaptation_workflow()
-
+    pipeline = build_pipeline()
     initial_state = create_initial_state(
         input_json=input_json,
-        selected_scenario=selected_scenario,
-        max_retries=max_retries,
+        scenario_prompt=scenario_prompt
     )
 
-    async for state in workflow.astream(initial_state):
+    async for state in pipeline.astream(initial_state):
         yield state

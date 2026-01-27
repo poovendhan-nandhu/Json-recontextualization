@@ -238,6 +238,9 @@ def merge_shards(collection: ShardCollection, original_data: dict) -> dict:
             continue
 
         # Apply modified content back to result
+        if not isinstance(shard.content, dict):
+            logger.warning(f"Shard '{shard.id}' content is not dict, skipping merge")
+            continue
         for path, value in shard.content.items():
             if "[*]" in path:
                 # Handle wildcard paths
