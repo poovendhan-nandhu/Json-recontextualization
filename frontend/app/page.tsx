@@ -20,7 +20,13 @@ type LogEntry = {
 }
 
 export default function Home() {
-  const [apiUrl, setApiUrl] = useState("ws://localhost:8000")
+  const [apiUrl, setApiUrl] = useState(() => {
+    if (typeof window !== "undefined") {
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:"
+      return `${protocol}//${window.location.host}`
+    }
+    return "ws://localhost:8000"
+  })
   const [scenarioPrompt, setScenarioPrompt] = useState("")
   const [inputJson, setInputJson] = useState("")
   const [isRunning, setIsRunning] = useState(false)

@@ -16,3 +16,5 @@ node_modules/
 .idea/
 *.egg-info/
 nul
+frontend/.next/
+frontend/node_modules/
