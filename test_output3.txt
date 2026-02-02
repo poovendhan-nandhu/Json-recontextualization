@@ -1,0 +1,33 @@
+
+======================================================================
+PIPELINE TEST: Prompt 1 - Gen Z Organic T-Shirts
+======================================================================
+
+Loading Sim2_topic_wizard_data.json...
+Input size: 105,481 chars
+
+Scenario: learners will act as a junior consultant for an exciting Gen Z organic T-shirts brand
+called "EcoThr...
+
+----------------------------------------------------------------------
+[PIPELINE] ========================================
+[PIPELINE] STARTING ADAPTATION PIPELINE
+[PIPELINE] ========================================
+[PIPELINE] Scenario: learners will act as a junior consultant for an exciting Gen Z organic T-shirts brand
+called "EcoThr...
+[PIPELINE] Input size: 105,481 chars
+[NODE] ========== ADAPT ==========
+[SIMPLE ADAPTER] Starting PARALLEL shard adaptation
+[SIMPLE ADAPTER] Input size: 105481 chars
+[SIMPLE ADAPTER] Scenario: learners will act as a junior consultant for an exciting Gen Z organic T-shirts brand
+called "EcoThr...
+[SIMPLE ADAPTER] Using OPTION B: One upfront call, then ALL shards in parallel
+Sharding JSON with 14 shard definitions
+Created 14 shards, 123 total IDs extracted
+[SIMPLE ADAPTER] 2 locked, 12 to adapt
+[SIMPLE ADAPTER] Extracted 11 questions for inference map
+[SIMPLE ADAPTER] STEP 0: Generating entity_map + domain_profile + adapted KLOs (ONE LLM call)...
+[MAPS] Found entities: 3 names, 0 emails
+[MAPS] Generating entity_map, domain_profile, AND adapted KLOs (Option B)...
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 8068 chars (~2017 tokens)
+AFC is enabled with max remote calls: 10.

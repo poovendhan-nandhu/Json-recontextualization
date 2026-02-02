@@ -1,0 +1,475 @@
+Loading Sim5_topic_wizard_data.json...
+Input size: 87,752 chars
+
+Scenario prompt:
+
+Acting as a consultant, students will develop a short executive summary recommending
+how a fast food brand called "BurgerBlitz" should respond to its competitor's $1 menu.
+They'll analyze the competi...
+
+============================================================
+STAGE 1: PARALLEL SHARD ADAPTATION (Gemini 3.0 Flash)
+============================================================
+[SIMPLE ADAPTER] Starting PARALLEL shard adaptation
+[SIMPLE ADAPTER] Input size: 87752 chars
+[SIMPLE ADAPTER] Scenario: 
+Acting as a consultant, students will develop a short executive summary recommending
+how a fast foo...
+[SIMPLE ADAPTER] Using OPTION B: One upfront call, then ALL shards in parallel
+Sharding JSON with 14 shard definitions
+Created 14 shards, 123 total IDs extracted
+[SIMPLE ADAPTER] 2 locked, 12 to adapt
+[SIMPLE ADAPTER] Extracted 21 questions for inference map
+[SIMPLE ADAPTER] STEP 0: Generating entity_map + domain_profile + adapted KLOs (ONE LLM call)...
+[MAPS] Found entities: 3 names, 2 emails
+[MAPS] Generating entity_map, domain_profile, AND adapted KLOs (Option B)...
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 8341 chars (~2085 tokens)
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 13.5s, response size: 3539 chars
+[GEMINI] Complete JSON received after 0 continuations
+[MAPS] Generated: 2 people, 2 roles, 21 term mappings, 3 forbidden terms, 3 KLOs
+[MAPS] Numeric factsheet: 4 metrics, 4 financial, 3 market
+[MAPS] People: ['Mark Caldwell', 'Taylor Morgan']
+[MAPS] Roles: {'Chief Strategy Officer': 'VP of Strategy', 'Marketing Director': 'Marketing Director'}
+[MAPS] Terminology (first 20): {'fast-casual brand': 'fast food chain', 'healthy fast food sector': 'quick service restaurant market', 'organic ingredients': 'quality ingredients', 'wholesome menu': 'signature menu items', 'core clientele': 'customer base', 'sustainability': 'brand values', 'declining foot traffic': 'reduced customer visits', 'brand integrity': 'brand reputation', 'profitability': 'profit margins', 'price-driven challenge': 'value menu competition', 'customer visits': 'customer traffic', 'loyal customer segments': 'core customer base', 'brand differentiation': 'brand positioning', 'revenue': 'sales revenue', 'adjust pricing': 'adjust pricing strategy', 'launch new offerings': 'introduce new menu items', 'intensify marketing': 'enhance marketing campaigns', 'alternative growth tactics': 'alternative growth strategies', 'market data': 'market insights', 'internal strengths': 'core competencies'}
+[MAPS] Forbidden terms: ['FreshTaste', 'HarvestBowls', "Nature's Crust"]
+[MAPS] Factsheet metrics: {'annual_sales': '$12.5M', 'market_share': '38%', 'capacity': '150,000 units/month', 'growth_rate': '15% YoY'}
+[RAG] Using Pinecone backend (cloud)
+[RAG] Pinecone client initialized
+[RAG] Pinecone connected to index: simulation
+[RAG] Pinecone indexed 12 facts
+[RAG] Indexed 12 factsheet values for consistency
+[SIMPLE ADAPTER] Upfront generation complete in 18.3s
+[SIMPLE ADAPTER]   - Entity map: 2 people, 2 roles
+[SIMPLE ADAPTER]   - Domain profile: 21 term mappings, 3 forbidden
+[SIMPLE ADAPTER]   - Adapted KLOs: 3
+[SIMPLE ADAPTER]   - Numeric factsheet: 4 metrics (indexed in RAG)
+[SIMPLE ADAPTER]   KLO 1: Learners will be able to analyze the competitor's value menu strategy by examini...
+[SIMPLE ADAPTER]   KLO 2: Learners will be able to evaluate BurgerBlitz’s competitive position by reviewin...
+[SIMPLE ADAPTER]   KLO 3: Learners will be able to recommend a strategic plan by comparing BurgerBlitz’s f...
+[SIMPLE ADAPTER] Adapting ALL 12 shards in PARALLEL...
+[SIMPLE ADAPTER] Processing ALL 12 unlocked shards in PARALLEL...
+[SIMPLE ADAPTER] Shard IDs: ['lesson_information', 'assessment_criteria', 'selected_scenario', 'workplace_scenario', 'chat_history', 'simulation_flow', 'emails', 'rubrics', 'resources', 'launch_settings', 'videos', 'selected_avatar']
+[SIMPLE ADAPTER] Processing shard 'lesson_information': content type=dict, keys=['lesson_information']
+[SIMPLE ADAPTER] Shard 'lesson_information' NOT split (589 chars <= 20000), adapting as WHOLE
+[SIMPLE ADAPTER] Processing shard 'assessment_criteria': content type=dict, keys=['assessment_criterion', 'selected_assessment_criterion']
+[SIMPLE ADAPTER] Shard 'assessment_criteria' NOT split (4221 chars <= 20000), adapting as WHOLE
+[SIMPLE ADAPTER] Processing shard 'selected_scenario': content type=dict, keys=['selected_scenario_option', 'scenario_description']
+[SIMPLE ADAPTER] Shard 'selected_scenario' NOT split (534 chars <= 20000), adapting as WHOLE
+[SIMPLE ADAPTER] Processing shard 'workplace_scenario': content type=dict, keys=['workplace_scenario']
+[SIMPLE ADAPTER] Shard 'workplace_scenario' NOT split (3147 chars <= 20000), adapting as WHOLE
+[SIMPLE ADAPTER] Processing shard 'chat_history': content type=dict, keys=['chat_history']
+[SIMPLE ADAPTER] Shard 'chat_history' NOT split (251 chars <= 20000), adapting as WHOLE
+[SIMPLE ADAPTER] Processing shard 'simulation_flow': content type=dict, keys=['simulation_flow']
+[SIMPLE ADAPTER] SPLITTING nested array 'Simulation Flow (Stages).simulation_flow' (62868 chars, 4 items)
+[SIMPLE ADAPTER]   -> Item 1 too large (45855), splitting by keys
+[SIMPLE ADAPTER]     -> Subkey data large (44653), splitting deeper
+[SIMPLE ADAPTER]     -> Batch 0 (9 fields, 7764 chars)
+[SIMPLE ADAPTER]     -> Batch 1 (3 fields, 9688 chars)
+[SIMPLE ADAPTER] Processing shard 'emails': content type=dict, keys=['emails', 'simulation_flow[*].data.task_email', 'simulation_flow[*].data.secondary_task_email']
+[SIMPLE ADAPTER] Shard 'emails' NOT split (4886 chars <= 20000), adapting as WHOLE
+[SIMPLE ADAPTER] Processing shard 'rubrics': content type=dict, keys=['rubric', 'simulation_flow[*].data.review.rubric', 'simulation_flow[*].data.review.tedo_align']
+[SIMPLE ADAPTER] SPLITTING nested array 'Rubrics & Review.simulation_flow[*].data.review.rubric' (26592 chars, 2 items)
+[SIMPLE ADAPTER] Processing shard 'resources': content type=dict, keys=['simulation_flow[*].data.resource', 'simulation_flow[*].data.resource_options']
+[SIMPLE ADAPTER] Shard 'resources' in NEVER_SPLIT_SHARDS - ADAPTING as WHOLE (15814 chars)
+[SIMPLE ADAPTER] Processing shard 'launch_settings': content type=dict, keys=['launch_settings', 'simulation_name', 'simulation_image', 'overview']
+[SIMPLE ADAPTER] Shard 'launch_settings' NOT split (5772 chars <= 20000), adapting as WHOLE
+[SIMPLE ADAPTER] Processing shard 'videos': content type=dict, keys=['videos', 'simulation_flow[*].children[*].data.video']
+[SIMPLE ADAPTER] Shard 'videos' NOT split (3548 chars <= 20000), adapting as WHOLE
+[SIMPLE ADAPTER] Processing shard 'selected_avatar': content type=dict, keys=['selected_avatar']
+[SIMPLE ADAPTER] Shard 'selected_avatar' NOT split (127 chars <= 20000), adapting as WHOLE
+[ADAPT SHARD] >>> START: lesson_information (589 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: lesson_information
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 13759 chars (~3439 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: assessment_criteria (4221 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: assessment_criteria
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 18242 chars (~4560 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: selected_scenario (534 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: selected_scenario
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 13699 chars (~3424 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: workplace_scenario (3147 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: workplace_scenario
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 16427 chars (~4106 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: chat_history (251 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: chat_history
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 13442 chars (~3360 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Simulation Flow (Stages).simulation_flow[0] (1489 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Simulation Flow (Stages).simulation_flow[0]
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 14271 chars (~3567 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Simulation Flow (Stages).simulation_flow[1].data.review (16395 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Simulation Flow (Stages).simulation_flow[1].data.review
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 31613 chars (~7903 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Simulation Flow (Stages).simulation_flow[1].data.resource (11650 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Simulation Flow (Stages).simulation_flow[1].data.resource
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 24594 chars (~6148 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Simulation Flow (Stages).simulation_flow[1].batch_0 (7941 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Simulation Flow (Stages).simulation_flow[1].batch_0
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 21538 chars (~5384 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Simulation Flow (Stages).simulation_flow[1].batch_1 (9764 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Simulation Flow (Stages).simulation_flow[1].batch_1
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 23223 chars (~5805 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Simulation Flow (Stages).simulation_flow[2] (14028 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Simulation Flow (Stages).simulation_flow[2]
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 33089 chars (~8272 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Simulation Flow (Stages).simulation_flow[3] (1488 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Simulation Flow (Stages).simulation_flow[3]
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 14308 chars (~3577 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: emails (4886 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: emails
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 18547 chars (~4636 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Rubrics & Review.simulation_flow[*].data.review.rubric[0] (14992 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Rubrics & Review.simulation_flow[*].data.review.rubric[0]
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 29510 chars (~7377 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT ITEM] >>> START: Rubrics & Review.simulation_flow[*].data.review.rubric[1] (11596 chars)
+[ADAPT ITEM] Calling Gemini (gemini-2.5-flash) for: Rubrics & Review.simulation_flow[*].data.review.rubric[1]
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 28117 chars (~7029 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: resources (15814 chars)
+[ADAPT SHARD] >>> INFERENCE MAP: Passing 21 questions to resources shard
+[RAG] Retrieved 10 facts from Pinecone
+[ADAPT SHARD] >>> RAG: Retrieved 10 facts for resources
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: resources
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 31967 chars (~7991 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: launch_settings (5772 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: launch_settings
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 18987 chars (~4746 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: videos (3548 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: videos
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 18137 chars (~4534 tokens)
+AFC is enabled with max remote calls: 10.
+[ADAPT SHARD] >>> START: selected_avatar (127 chars)
+[ADAPT SHARD] Calling Gemini (gemini-2.5-flash) for: selected_avatar
+[GEMINI] Starting API call with gemini-2.5-flash, prompt size: 13289 chars (~3322 tokens)
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 7.0s, response size: 155 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: selected_avatar
+[ADAPT SHARD] <<< DONE: selected_avatar (input=127, output=127)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 19.3s, response size: 570 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: selected_scenario
+[ADAPT SHARD] <<< DONE: selected_scenario (input=534, output=536)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 15.4s, response size: 1830 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT ITEM] Gemini returned for: Simulation Flow (Stages).simulation_flow[3]
+[ADAPT ITEM] <<< DONE: Simulation Flow (Stages).simulation_flow[3] (input=1488, output=1470)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 23.5s, response size: 646 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: lesson_information
+[ADAPT SHARD] <<< DONE: lesson_information (input=589, output=613)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 22.3s, response size: 3345 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: workplace_scenario
+[ADAPT SHARD] <<< DONE: workplace_scenario (input=3147, output=3177)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 21.7s, response size: 1799 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT ITEM] Gemini returned for: Simulation Flow (Stages).simulation_flow[0]
+[ADAPT ITEM] <<< DONE: Simulation Flow (Stages).simulation_flow[0] (input=1489, output=1477)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 20.9s, response size: 5458 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: emails
+[ADAPT SHARD] <<< DONE: emails (input=4886, output=4912)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 18.6s, response size: 4977 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: videos
+[ADAPT SHARD] <<< DONE: videos (input=3548, output=3513)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 29.6s, response size: 5143 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: assessment_criteria
+[ADAPT SHARD] <<< DONE: assessment_criteria (input=4221, output=4267)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 24.5s, response size: 5863 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: launch_settings
+[ADAPT SHARD] <<< DONE: launch_settings (input=5772, output=5757)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 29.7s, response size: 17898 chars
+[GEMINI] JSON incomplete (error at char 6379), requesting continuation 1/5
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 31.1s, response size: 18211 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT ITEM] Gemini returned for: Rubrics & Review.simulation_flow[*].data.review.rubric[1]
+[ADAPT ITEM] <<< DONE: Rubrics & Review.simulation_flow[*].data.review.rubric[1] (input=11596, output=14144)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 39.6s, response size: 21058 chars
+[GEMINI] JSON incomplete (error at char 17618), requesting continuation 1/5
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 43.3s, response size: 11542 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT ITEM] Gemini returned for: Simulation Flow (Stages).simulation_flow[1].data.resource
+[ADAPT ITEM] <<< DONE: Simulation Flow (Stages).simulation_flow[1].data.resource (input=11650, output=11749)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 44.2s, response size: 19141 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT ITEM] Gemini returned for: Simulation Flow (Stages).simulation_flow[1].data.review
+[ADAPT ITEM] <<< DONE: Simulation Flow (Stages).simulation_flow[1].data.review (input=16395, output=17042)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 49.3s, response size: 13944 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT ITEM] Gemini returned for: Simulation Flow (Stages).simulation_flow[1].batch_1
+[ADAPT ITEM] <<< DONE: Simulation Flow (Stages).simulation_flow[1].batch_1 (input=9764, output=13640)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 49.8s, response size: 18629 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: resources
+[ADAPT SHARD] <<< DONE: resources (input=15814, output=18470)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 59.2s, response size: 26525 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT ITEM] Gemini returned for: Simulation Flow (Stages).simulation_flow[1].batch_0
+[ADAPT ITEM] <<< DONE: Simulation Flow (Stages).simulation_flow[1].batch_0 (input=7941, output=26158)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] API call completed in 80.0s, response size: 28871 chars
+[GEMINI] Complete JSON received after 0 continuations
+[ADAPT SHARD] Gemini returned for: chat_history
+[ADAPT SHARD] <<< DONE: chat_history (input=251, output=27751)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] JSON incomplete (error at char 6379), requesting continuation 2/5
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] JSON incomplete (error at char 6379), requesting continuation 3/5
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] JSON incomplete (error at char 6379), requesting continuation 4/5
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] JSON incomplete (error at char 6379), requesting continuation 5/5
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] Reached max continuations (5), JSON may be incomplete
+[ADAPT ITEM] Gemini returned for: Rubrics & Review.simulation_flow[*].data.review.rubric[0]
+[ADAPT ITEM] <<< DONE: Rubrics & Review.simulation_flow[*].data.review.rubric[0] (input=14992, output=15926)
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] JSON incomplete (error at char 17618), requesting continuation 2/5
+AFC is enabled with max remote calls: 10.
+HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent "HTTP/1.1 200 OK"
+[GEMINI] Continuation returned None, stopping
+[ADAPT ITEM] Gemini returned for: Simulation Flow (Stages).simulation_flow[2]
+[ADAPT ITEM] <<< DONE: Simulation Flow (Stages).simulation_flow[2] (input=14028, output=14508)
+[SIMPLE ADAPTER] Reassembled batch_fields for [1]: 7/7 fields matched
+[SIMPLE ADAPTER] Reassembled batch_fields for [1]: 3/3 fields matched
+Merging shards back into JSON
+[CLEANUP] Replaced leaked term 'FreshTaste' with 'BurgerBlitz'
+[CLEANUP] Replaced leaked term 'HarvestBowls' with 'BurgerBlitz'
+[POST-PROCESS] Cleaned 3 forbidden terms
+[SIMPLE ADAPTER] Complete in 320495ms
+[SIMPLE ADAPTER] Output size: 123616 chars
+[SIMPLE ADAPTER] Shards processed: 12
+Mode: parallel_shards
+Time: 320495ms (320.8s)
+Shards processed: 12
+
+============================================================
+STAGE 2: VALIDATION + REPAIR (GPT-4o)
+============================================================
+[V+R] Iteration 1/2
+[VALIDATOR] Running all 8 agents in parallel...
+[VALIDATOR] Stripped locked shards (scenarioOptions, workspaceIds)
+[VALIDATOR] Running Domain Fidelity Agent...
+[VALIDATOR] Running Context Fidelity Agent...
+[VALIDATOR] Running Resource Quality Agent...
+[VALIDATOR] Skipping minimal main resource at /simulation_flow/2/data/resource (0 chars)
+[VALIDATOR] Found 1 main resources, 5 resource options
+[VALIDATOR] Running KLO-Question Alignment Agent...
+[VALIDATOR] Extracted 3 KLOs
+[VALIDATOR] Found 6 questions, 3 KLOs
+[VALIDATOR] Running Consistency Agent...
+[VALIDATOR] Running Completeness Agent...
+[VALIDATOR] Running KLO-Resource Alignment Agent...
+[VALIDATOR] Running Question Solvability Agent...
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Resource Quality: 1 main, 5 options checked, 1 issues, score=80.0%
+[VALIDATOR]   -> Word count 1489 outside 800-1400 range
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Consistency: 2 company vars, 2 manager vars, 1 issues = 80.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Ignoring structural empty field: scenario_description
+[VALIDATOR] Completeness: 4 issues, penalty=25%, score=75.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] KLO-Question: 6 questions, 1 issues = 83.3%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] KLO-Resource: 3 KLOs, 0 unsupported = 100.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Solvability: 5 questions, 0 unsolvable = 100.0%
+[VALIDATOR] Overall: 89.42%, Issues: 9, Passed: False
+[V+R] Running specialized Resource Fixer for 1 issues
+[RESOURCE FIXER] Fixing 1 MAIN resource quality issues...
+[RESOURCE FIXER] Fixing resource at /simulation_flow/1/data/resource (1 issues)
+[RESOURCE FIXER] Processing resource at /simulation_flow/1/data/resource (12639 chars)
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[RESOURCE FIXER] Rewrote resource: 1489 -> 929 words
+[RESOURCE FIXER] Updated 'markdown_text' field
+[V+R] Running generic repair for 8 other issues
+[REPAIR] Fixing 8 issues with patches...
+[REPAIR] Skipping 0 issues from KLO-Resource Alignment (needs regeneration, not patches)
+[REPAIR] Skipping 0 issues from Question Solvability (needs regeneration, not patches)
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[REPAIR] Applying 1 auto-generated patches from validators
+[REPAIR] Protected 1 resource contents from string patches
+[REPAIR] Applied string patch: 'Sarah Miller...' -> 'David Chen...'
+[REPAIR] Applied 1/1 string patches
+[REPAIR] Restored 1 protected resource contents
+[REPAIR] Applying 15 path-based patches
+Some patches have invalid paths: ['/chat_history/submission_questions/5: Path does not exist: /chat_history/submission_questions/5']
+No valid patches to apply
+[REPAIR] Applied 0/15 path patches
+[REPAIR] Failed patch /selected_scenario_option/option: /chat_history/submission_questions/5: Path does not exist: /chat_history/submission_questions/5
+[REPAIR] Applying 12 string-based patches
+[REPAIR] Protected 1 resource contents from string patches
+[REPAIR] Applied string patch: 'MegaBurger...' -> 'a competitor...'
+[REPAIR] Applied string patch: 'FastBurger...' -> 'a competitor...'
+[REPAIR] Applied string patch: 'Nature’s Crust...' -> 'a competitor...'
+[REPAIR] Applied 3/12 string patches
+[REPAIR] Restored 1 protected resource contents
+[V+R] Iteration 2/2
+[VALIDATOR] Running all 8 agents in parallel...
+[VALIDATOR] Stripped locked shards (scenarioOptions, workspaceIds)
+[VALIDATOR] Running Domain Fidelity Agent...
+[VALIDATOR] Running Context Fidelity Agent...
+[VALIDATOR] Running Resource Quality Agent...
+[VALIDATOR] Skipping minimal main resource at /simulation_flow/2/data/resource (0 chars)
+[VALIDATOR] Found 1 main resources, 5 resource options
+[VALIDATOR] Running KLO-Question Alignment Agent...
+[VALIDATOR] Extracted 3 KLOs
+[VALIDATOR] Found 6 questions, 3 KLOs
+[VALIDATOR] Running Consistency Agent...
+[VALIDATOR] Running Completeness Agent...
+[VALIDATOR] Running KLO-Resource Alignment Agent...
+[VALIDATOR] Running Question Solvability Agent...
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Resource Quality: 1 main, 5 options checked, 0 issues, score=100.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Consistency: 1 company vars, 1 manager vars, 2 issues = 80.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Ignoring structural empty field: scenario_description
+[VALIDATOR] Ignoring structural empty field: overview
+[VALIDATOR] Completeness: 8 issues, penalty=45%, score=55.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] KLO-Question: 6 questions, 1 issues = 83.3%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] KLO-Resource: 3 KLOs, 1 unsupported = 66.7%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Solvability: 5 questions, 0 unsolvable = 100.0%
+[VALIDATOR] Overall: 85.25%, Issues: 14, Passed: False
+[V+R] Running generic repair for 14 other issues
+[REPAIR] Fixing 14 issues with patches...
+[REPAIR] Skipping 1 issues from KLO-Resource Alignment (needs regeneration, not patches)
+[REPAIR] Skipping 0 issues from Question Solvability (needs regeneration, not patches)
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[REPAIR] Applying 2 auto-generated patches from validators
+[REPAIR] Protected 1 resource contents from string patches
+[REPAIR] Applied string patch: 'David Chen (Marketing Director)...' -> 'David Chen...'
+[REPAIR] Applied 1/2 string patches
+[REPAIR] Restored 1 protected resource contents
+[REPAIR] Applying 7 path-based patches
+Some patches have invalid paths: ['/videos: Type mismatch: dict -> list']
+No valid patches to apply
+[REPAIR] Applied 0/7 path patches
+[REPAIR] Failed patch /selected_scenario_option/option: /videos: Type mismatch: dict -> list
+[REPAIR] Applying 1 string-based patches
+[REPAIR] Protected 1 resource contents from string patches
+[REPAIR] Applied 0/1 string patches
+[REPAIR] Restored 1 protected resource contents
+[VALIDATOR] Running all 8 agents in parallel...
+[VALIDATOR] Stripped locked shards (scenarioOptions, workspaceIds)
+[VALIDATOR] Running Domain Fidelity Agent...
+[VALIDATOR] Running Context Fidelity Agent...
+[VALIDATOR] Running Resource Quality Agent...
+[VALIDATOR] Skipping minimal main resource at /simulation_flow/2/data/resource (0 chars)
+[VALIDATOR] Found 1 main resources, 5 resource options
+[VALIDATOR] Running KLO-Question Alignment Agent...
+[VALIDATOR] Extracted 3 KLOs
+[VALIDATOR] Found 6 questions, 3 KLOs
+[VALIDATOR] Running Consistency Agent...
+[VALIDATOR] Running Completeness Agent...
+[VALIDATOR] Running KLO-Resource Alignment Agent...
+[VALIDATOR] Running Question Solvability Agent...
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Resource Quality: 1 main, 5 options checked, 0 issues, score=100.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Consistency: 1 company vars, 1 manager vars, 2 issues = 80.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Completeness: 3 issues, penalty=15%, score=85.0%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] KLO-Question: 6 questions, 1 issues = 83.3%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] KLO-Resource: 3 KLOs, 1 unsupported = 66.7%
+HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+[VALIDATOR] Solvability: 5 questions, 0 unsolvable = 100.0%
+[VALIDATOR] Overall: 88.75%, Issues: 9, Passed: False
+Validation time: 186.4s
+Overall score: 88.75%
+Passed: False
+Total issues: 9
+
+Agent Results:
+  Domain Fidelity: 100.00% [PASS] (0 issues)
+  Context Fidelity: 95.00% [FAIL] (2 issues)
+  Resource Quality: 100.00% [PASS] (0 issues)
+  KLO-Question Alignment: 83.33% [FAIL] (1 issues)
+  Consistency: 80.00% [FAIL] (2 issues)
+  Completeness: 85.00% [FAIL] (3 issues)
+  KLO-Resource Alignment: 66.67% [FAIL] (1 issues)
+  Question Solvability: 100.00% [PASS] (0 issues)
+
+============================================================
+FINAL RESULTS
+============================================================
+Total time: 507.3s
+Input: 87,752 chars
+Output: 118,981 chars
+
+Output saved to: simple_adapted_output.json
+
+============================================================
+QUICK VALIDATION (unlocked content only)
+============================================================
+  organic: 1 occurrences [OK]
+  T-shirt: 0 occurrences [MISSING]
+  sustainable: 6 occurrences [OK]
+  Gen Z: 11 occurrences [OK]
+  fashion: 0 occurrences [MISSING]
+
+Source terms (should be 0):
+  Summit Innovations: 0 occurrences [OK]
+  Elizabeth Carter: 0 occurrences [OK]
+  HR (standalone): 0 occurrences [OK]
+  hiring: 0 occurrences [OK]
+  candidate: 0 occurrences [OK]
+  interview: 0 occurrences [OK]
+
+SUCCESS: No source terms found!
