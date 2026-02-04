@@ -1,17 +1,31 @@
 """
-Simple Adapter - Phase 1 Implementation
+Simple Adapter - V2 Implementation with Skeleton-Based Generation
 
-Simplified approach: Scenario Prompt + JSON -> LLM -> Adapted JSON
+NEW APPROACH (V2):
+- Stage 0: Generate entity_map, domain_profile, adapted_klos, alignment_map, canonical_numbers, resource_sections
+- Programmatic: Extract skeleton (structure only, no content) and word_targets from source
+- Stage 1: Generate content to FILL skeleton (not adapt source content)
+- Post-process: Enforce entity_map and canonical_numbers consistency
 
-No factsheet extraction, no RAG, no poison lists.
-Just let the LLM figure out what to change based on the scenario prompt.
+OLD APPROACH (V1 - still available):
+- Scenario Prompt + JSON -> LLM -> Adapted JSON
+- Shows source content to LLM, asks to "adapt"
 
 Usage:
     from src.stages.simple_adapter import adapt_simple
 
+    # V2 (skeleton-based generation) - default
     result = await adapt_simple(
         input_json=my_json,
-        scenario_prompt="learners will act as a junior consultant..."
+        scenario_prompt="learners will act as a junior consultant...",
+        use_v2=True  # default
+    )
+
+    # V1 (legacy adaptation)
+    result = await adapt_simple(
+        input_json=my_json,
+        scenario_prompt="...",
+        use_v2=False
     )
 """
 import json
@@ -21,6 +35,13 @@ import time
 import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
+
+# V2 imports - skeleton-based generation
+from ..extractors.skeleton_extractor import extract_skeleton, extract_structure_summary, get_shard_skeleton
+from ..extractors.word_target_extractor import measure_word_targets
+from ..generators.stage0_generator import generate_stage0_content, validate_stage0_output, get_alignment_for_shard, Stage0Result
+from ..prompts.shard_prompts import build_shard_prompt, CONTENT_RULES
+from ..enforcers.post_processor import post_process_adapted_json
 
 # Configure logging if not already configured
 if not logging.getLogger().handlers:
@@ -53,9 +74,14 @@ class SimpleAdaptationResult:
     time_ms: int
     input_chars: int
     output_chars: int
-    mode: str = "monolithic"  # or "sharded"
+    mode: str = "monolithic"  # or "sharded" or "skeleton_v2"
     shards_processed: int = 0
     errors: list = field(default_factory=list)
+    # V2 additions
+    entity_map: dict = field(default_factory=dict)
+    domain_profile: dict = field(default_factory=dict)
+    alignment_map: dict = field(default_factory=dict)
+    canonical_numbers: dict = field(default_factory=dict)
 
 
 def _repair_json(text: str) -> dict | list:
@@ -878,6 +904,32 @@ No explanations. Just valid JSON.
 - Do NOT wrap output in a path-like key"""
 
 
+def _find_json_overlap(end_text: str, start_text: str, max_check: int = 500) -> int:
+    """
+    Find overlap between end of accumulated text and start of continuation.
+
+    When Gemini continues output, it sometimes repeats context from where it left off.
+    This function detects that overlap so we can trim it before concatenation.
+
+    Args:
+        end_text: The end of the accumulated text
+        start_text: The start of the continuation text
+        max_check: Maximum characters to check for overlap
+
+    Returns:
+        Number of overlapping characters (0 if no overlap)
+    """
+    end_sample = end_text[-max_check:] if len(end_text) > max_check else end_text
+    start_sample = start_text[:max_check] if len(start_text) > max_check else start_text
+
+    # Look for overlap - start with longest possible and work down
+    for i in range(min(len(end_sample), len(start_sample)), 10, -1):
+        if end_sample[-i:] == start_sample[:i]:
+            return i
+
+    return 0
+
+
 async def call_gemini_async(
     prompt: str,
     expect_json: bool = False,
@@ -911,14 +963,23 @@ async def call_gemini_async(
     import time as _time
     start_time = _time.time()
 
-    response = await client.aio.models.generate_content(
-        model=model,
-        contents=prompt,
-        config={
-            "temperature": 0.0,
-            "max_output_tokens": 65536
-        }
-    )
+    # Add timeout to prevent indefinite hanging (120 seconds)
+    try:
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={
+                    "temperature": 0.0,
+                    "max_output_tokens": 65536
+                }
+            ),
+            timeout=120.0
+        )
+    except asyncio.TimeoutError:
+        elapsed = _time.time() - start_time
+        logger.error(f"[GEMINI] API call timed out after {elapsed:.1f}s")
+        raise ValueError(f"Gemini API call timed out after {elapsed:.1f}s")
 
     elapsed = _time.time() - start_time
     accumulated_text = response.text
@@ -989,6 +1050,12 @@ Continue from there. Output ONLY the remaining JSON, no explanation. Start exact
                 lines = lines[:-1]
             continuation_text = "\n".join(lines)
 
+        # Detect and trim overlap before concatenation
+        overlap = _find_json_overlap(accumulated_text, continuation_text)
+        if overlap > 10:  # Significant overlap detected
+            logger.info(f"[GEMINI] Detected {overlap} char overlap in continuation, trimming")
+            continuation_text = continuation_text[overlap:]
+
         # Append continuation
         accumulated_text = accumulated_text.rstrip() + continuation_text
         continuation_count += 1
@@ -1004,17 +1071,26 @@ Continue from there. Output ONLY the remaining JSON, no explanation. Start exact
 async def adapt_simple(
     input_json: dict,
     scenario_prompt: str,
+    use_v2: bool = True,  # NEW: Use skeleton-based generation by default
 ) -> SimpleAdaptationResult:
     """
     Simple adaptation using PARALLEL SHARDING.
 
-    Key insight: Scenario prompt is the SINGLE SOURCE OF TRUTH.
-    All shards get the SAME scenario prompt, so they all derive
-    the same company/KLOs/terminology = cross-connected.
+    V2 (default): Skeleton-based GENERATION
+    - Extracts skeleton (structure only, no content)
+    - Stage 0 generates alignment_map, canonical_numbers, resource_sections
+    - Each shard GENERATES content to fill skeleton
+    - Post-processes to enforce consistency
+
+    V1 (legacy): Content-based ADAPTATION
+    - Shows source content to LLM
+    - Asks LLM to "adapt" content
+    - Tends to copy source phrasing
 
     Args:
         input_json: The simulation JSON to adapt
-        scenario_prompt: Description of the target scenario (source of truth)
+        scenario_prompt: Description of the target scenario
+        use_v2: If True, use skeleton-based generation (default). If False, use legacy adaptation.
 
     Returns:
         SimpleAdaptationResult with adapted JSON
@@ -1022,14 +1098,35 @@ async def adapt_simple(
     start_time = time.time()
     input_chars = len(json.dumps(input_json))
 
-    logger.info(f"[SIMPLE ADAPTER] Starting PARALLEL shard adaptation")
+    if use_v2:
+        logger.info(f"[SIMPLE ADAPTER] Starting V2 SKELETON-BASED GENERATION")
+    else:
+        logger.info(f"[SIMPLE ADAPTER] Starting V1 PARALLEL shard adaptation (legacy)")
+
     logger.info(f"[SIMPLE ADAPTER] Input size: {input_chars} chars")
     logger.info(f"[SIMPLE ADAPTER] Scenario: {scenario_prompt[:100]}...")
 
-    # Always use parallel sharding - this is the correct approach
-    adapted_json, shards_count, errors = await _adapt_with_sharding(
-        input_json, scenario_prompt
-    )
+    if use_v2:
+        # NEW: Skeleton-based generation
+        result = await _adapt_with_sharding_v2(input_json, scenario_prompt)
+        adapted_json = result["adapted_json"]
+        shards_count = result["shards_count"]
+        errors = result["errors"]
+        entity_map = result.get("entity_map", {})
+        domain_profile = result.get("domain_profile", {})
+        alignment_map = result.get("alignment_map", {})
+        canonical_numbers = result.get("canonical_numbers", {})
+        mode = "skeleton_v2"
+    else:
+        # Legacy: Content-based adaptation
+        adapted_json, shards_count, errors = await _adapt_with_sharding(
+            input_json, scenario_prompt
+        )
+        entity_map = {}
+        domain_profile = {}
+        alignment_map = {}
+        canonical_numbers = {}
+        mode = "parallel_shards"
 
     time_ms = int((time.time() - start_time) * 1000)
     output_chars = len(json.dumps(adapted_json))
@@ -1044,9 +1141,13 @@ async def adapt_simple(
         time_ms=time_ms,
         input_chars=input_chars,
         output_chars=output_chars,
-        mode="parallel_shards",
+        mode=mode,
         shards_processed=shards_count,
         errors=errors,
+        entity_map=entity_map,
+        domain_profile=domain_profile,
+        alignment_map=alignment_map,
+        canonical_numbers=canonical_numbers,
     )
 
 
@@ -1164,7 +1265,8 @@ async def _adapt_with_sharding(
                     for key, val in shard.content.items():
                         if isinstance(val, list) and len(val) > 1:
                             array_size = len(json.dumps(val))
-                            if array_size > MAX_SHARD_SIZE * 0.5:
+                            # More aggressive splitting (30% threshold) to prevent output truncation
+                            if array_size > MAX_SHARD_SIZE * 0.3:
                                 logger.info(f"[SIMPLE ADAPTER] SPLITTING nested array '{shard.name}.{key}' ({array_size} chars, {len(val)} items)")
                                 for idx, item in enumerate(val):
                                     item_size = len(json.dumps(item))
@@ -1358,6 +1460,247 @@ async def _adapt_with_sharding(
     # Count total shards processed (all unlocked shards)
     total_shards = len(unlocked_shards)
     return adapted_json, total_shards, errors
+
+
+# =============================================================================
+# V2: SKELETON-BASED GENERATION (NEW)
+# =============================================================================
+
+async def _adapt_with_sharding_v2(
+    input_json: dict,
+    scenario_prompt: str
+) -> dict:
+    """
+    V2: Skeleton-based GENERATION (not adaptation).
+
+    Flow:
+    1. PROGRAMMATIC: Extract skeleton, word_targets, structure_summary from source
+    2. STAGE 0: Generate entity_map, domain_profile, adapted_klos, alignment_map, canonical_numbers, resource_sections
+    3. STAGE 1: Parallel shard GENERATION (each shard fills skeleton, doesn't see source content)
+    4. POST-PROCESS: Enforce entity_map and canonical_numbers consistency
+
+    Returns:
+        dict with keys: adapted_json, shards_count, errors, entity_map, domain_profile, alignment_map, canonical_numbers
+    """
+    from .sharder import Sharder, merge_shards
+    from ..models.shard import LockState
+    import time as _time
+
+    logger.info("[V2] ========== SKELETON-BASED GENERATION ==========")
+
+    errors = []
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 1: PROGRAMMATIC - Extract from source (instant)
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("[V2] STEP 1: Extracting skeleton and word targets...")
+    step1_start = _time.time()
+
+    # Extract skeleton (structure with IDs, no content)
+    skeleton = extract_skeleton(input_json)
+    logger.info(f"[V2]   - Skeleton extracted")
+
+    # Extract structure summary (counts, IDs)
+    structure_summary = extract_structure_summary(input_json)
+    logger.info(f"[V2]   - Structure: {structure_summary['klo_count']} KLOs, "
+                f"{structure_summary['question_count']} questions, "
+                f"{structure_summary['rubric_count']} rubrics")
+
+    # Measure word targets from source
+    word_targets = measure_word_targets(input_json)
+    logger.info(f"[V2]   - Word targets measured")
+
+    step1_time = _time.time() - step1_start
+    logger.info(f"[V2] STEP 1 complete in {step1_time:.2f}s")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 2: STAGE 0 - Generate domain content (one LLM call)
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("[V2] STEP 2: Stage 0 generation (alignment_map, canonical_numbers, etc.)...")
+    step2_start = _time.time()
+
+    try:
+        stage0_result = await generate_stage0_content(
+            scenario_prompt=scenario_prompt,
+            structure_summary=structure_summary,
+            call_llm_func=call_gemini_async,
+            model=DEFAULT_MODEL
+        )
+
+        # Validate Stage 0 output
+        validation_errors = validate_stage0_output(stage0_result, structure_summary)
+        if validation_errors:
+            logger.warning(f"[V2] Stage 0 validation found {len(validation_errors)} issues")
+            errors.extend([f"stage0: {e}" for e in validation_errors[:3]])
+            # Continue anyway - partial results are better than nothing
+
+        step2_time = _time.time() - step2_start
+        logger.info(f"[V2] STEP 2 complete in {step2_time:.2f}s")
+        logger.info(f"[V2]   - entity_map: company={stage0_result.entity_map.get('company', {}).get('name', 'N/A')}")
+        logger.info(f"[V2]   - alignment_map: {len(stage0_result.alignment_map)} entries")
+        logger.info(f"[V2]   - canonical_numbers: {len(stage0_result.canonical_numbers)} metrics")
+        logger.info(f"[V2]   - resource_sections: {len(stage0_result.resource_sections)} sections")
+
+    except Exception as e:
+        logger.error(f"[V2] Stage 0 failed: {e}")
+        errors.append(f"stage0_generation: {str(e)}")
+        # Create empty Stage 0 result
+        stage0_result = Stage0Result(errors=[str(e)])
+        step2_time = _time.time() - step2_start
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 3: PARALLEL SHARD GENERATION
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("[V2] STEP 3: Parallel shard generation...")
+    step3_start = _time.time()
+
+    # Shard the SKELETON (not source JSON)
+    sharder = Sharder()
+    collection = sharder.shard(skeleton)
+
+    # Separate locked vs unlocked
+    locked_shards = [s for s in collection.shards if s.lock_state == LockState.FULLY_LOCKED]
+    unlocked_shards = [s for s in collection.shards if s.lock_state != LockState.FULLY_LOCKED]
+
+    logger.info(f"[V2]   - {len(locked_shards)} locked, {len(unlocked_shards)} to generate")
+
+    # Build tasks for parallel generation
+    tasks = []
+    task_info = []
+
+    for shard in unlocked_shards:
+        if shard.id in SKIP_SHARDS:
+            logger.info(f"[V2]   - Skipping shard '{shard.id}'")
+            continue
+
+        # Get alignment requirements for this shard
+        alignment_req = get_alignment_for_shard(
+            shard.id,
+            stage0_result.alignment_map,
+            stage0_result.adapted_klos
+        )
+
+        # Shards that contain questions and need KLO alignment
+        # These shards contain questions that must assess KLOs, so they need the KLO-Question mapping
+        question_containing_shards = ["simulation_flow", "rubrics", "resources", "assessment_criteria"]
+
+        # Build the generation prompt
+        prompt = build_shard_prompt(
+            shard_name=shard.id,
+            skeleton=shard.content,
+            word_targets=word_targets,
+            entity_map=stage0_result.entity_map,
+            domain_profile=stage0_result.domain_profile,
+            canonical_numbers=stage0_result.canonical_numbers,
+            scenario_prompt=scenario_prompt,
+            alignment_requirements=alignment_req if alignment_req else None,
+            resource_sections=stage0_result.resource_sections if shard.id == "resources" else None,
+            adapted_klos=stage0_result.adapted_klos if shard.id in question_containing_shards else None
+        )
+
+        # Create task
+        task = _generate_shard_content(shard.id, prompt, shard.content)
+        tasks.append(task)
+        task_info.append({"shard": shard})
+
+    # Run all tasks in parallel
+    if tasks:
+        logger.info(f"[V2]   - Running {len(tasks)} generation tasks in parallel...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Process results
+        for i, result in enumerate(results):
+            info = task_info[i]
+            shard = info["shard"]
+
+            if isinstance(result, Exception):
+                logger.error(f"[V2]   - Shard '{shard.id}' failed: {result}")
+                errors.append(f"{shard.id}: {str(result)}")
+            else:
+                shard.content = result
+                shard.current_hash = ""
+                collection.update_shard(shard)
+                logger.info(f"[V2]   - Shard '{shard.id}' generated successfully")
+
+    step3_time = _time.time() - step3_start
+    logger.info(f"[V2] STEP 3 complete in {step3_time:.2f}s")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 4: MERGE SHARDS
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("[V2] STEP 4: Merging shards...")
+
+    # Merge back using ORIGINAL input_json structure (not skeleton)
+    # The skeleton was just for sharding - we merge results back to original structure
+    adapted_json = merge_shards(collection, input_json)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STEP 5: POST-PROCESSING
+    # ═══════════════════════════════════════════════════════════════════
+    logger.info("[V2] STEP 5: Post-processing enforcement...")
+    step5_start = _time.time()
+
+    adapted_json = post_process_adapted_json(
+        adapted_json=adapted_json,
+        entity_map=stage0_result.entity_map,
+        canonical_numbers=stage0_result.canonical_numbers,
+        domain_profile=stage0_result.domain_profile
+    )
+
+    step5_time = _time.time() - step5_start
+    logger.info(f"[V2] STEP 5 complete in {step5_time:.2f}s")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # DONE
+    # ═══════════════════════════════════════════════════════════════════
+    total_time = step1_time + step2_time + step3_time + step5_time
+    logger.info(f"[V2] ========== COMPLETE in {total_time:.2f}s ==========")
+    logger.info(f"[V2] Timings: Step1={step1_time:.1f}s, Step2={step2_time:.1f}s, "
+                f"Step3={step3_time:.1f}s, Step5={step5_time:.1f}s")
+
+    return {
+        "adapted_json": adapted_json,
+        "shards_count": len(unlocked_shards),
+        "errors": errors,
+        "entity_map": stage0_result.entity_map,
+        "domain_profile": stage0_result.domain_profile,
+        "alignment_map": stage0_result.alignment_map,
+        "canonical_numbers": stage0_result.canonical_numbers,
+    }
+
+
+@traceable(name="generate_shard_v2", run_type="llm")
+async def _generate_shard_content(
+    shard_id: str,
+    prompt: str,
+    skeleton: dict
+) -> dict:
+    """
+    Generate content for a single shard using the skeleton-based prompt.
+
+    Args:
+        shard_id: The shard identifier
+        prompt: The complete generation prompt
+        skeleton: The skeleton structure (for reference)
+
+    Returns:
+        Generated content as dict
+    """
+    logger.info(f"[GENERATE V2] >>> START: {shard_id}")
+
+    try:
+        response_text = await call_gemini_async(prompt, expect_json=True, model=DEFAULT_MODEL)
+        generated_content = _repair_json(response_text)
+
+        output_size = len(json.dumps(generated_content))
+        logger.info(f"[GENERATE V2] <<< DONE: {shard_id} ({output_size} chars)")
+
+        return generated_content
+
+    except Exception as e:
+        logger.error(f"[GENERATE V2] Failed for {shard_id}: {e}")
+        # Return the skeleton as fallback (better than nothing)
+        return skeleton
 
 
 @traceable(name="adapt_item", run_type="llm")

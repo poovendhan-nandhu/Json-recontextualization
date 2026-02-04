@@ -35,12 +35,35 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null)
   const [validationReport, setValidationReport] = useState<string | null>(null)
   const [isGeneratingReport, setIsGeneratingReport] = useState(false)
+  const [elapsedTime, setElapsedTime] = useState(0)
   const wsRef = useRef<WebSocket | null>(null)
   const logsEndRef = useRef<HTMLDivElement>(null)
+  const timerRef = useRef<NodeJS.Timeout | null>(null)
 
   useEffect(() => {
     logsEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }, [logs])
+
+  // Timer effect - starts when pipeline runs, stops when done
+  useEffect(() => {
+    if (isRunning) {
+      setElapsedTime(0)
+      const startTime = Date.now()
+      timerRef.current = setInterval(() => {
+        setElapsedTime(Math.floor((Date.now() - startTime) / 1000))
+      }, 1000)
+    } else {
+      if (timerRef.current) {
+        clearInterval(timerRef.current)
+        timerRef.current = null
+      }
+    }
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current)
+      }
+    }
+  }, [isRunning])
 
   const getHttpUrl = () => {
     // Convert ws:// to http:// or wss:// to https://
@@ -163,6 +186,12 @@ export default function Home() {
     return "destructive"
   }
 
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60)
+    const secs = seconds % 60
+    return `${mins}:${secs.toString().padStart(2, '0')}`
+  }
+
   const downloadResult = () => {
     if (!finalResult?.data?.final_json) return
     const blob = new Blob([JSON.stringify(finalResult.data.final_json, null, 2)], { type: "application/json" })
@@ -212,7 +241,7 @@ export default function Home() {
                 className="h-48 font-mono text-xs"
               />
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 items-center">
               <Button onClick={runPipeline} disabled={isRunning} className="flex-1">
                 {isRunning ? (
                   <>
@@ -224,9 +253,19 @@ export default function Home() {
                 )}
               </Button>
               {isRunning && (
-                <Button variant="outline" onClick={stopPipeline}>
-                  Stop
-                </Button>
+                <>
+                  <div className="px-3 py-2 bg-blue-50 border border-blue-200 rounded-md text-blue-700 font-mono text-sm">
+                    {formatTime(elapsedTime)}
+                  </div>
+                  <Button variant="outline" onClick={stopPipeline}>
+                    Stop
+                  </Button>
+                </>
+              )}
+              {!isRunning && elapsedTime > 0 && (
+                <div className="px-3 py-2 bg-green-50 border border-green-200 rounded-md text-green-700 font-mono text-sm">
+                  {formatTime(elapsedTime)}
+                </div>
               )}
             </div>
             {error && (

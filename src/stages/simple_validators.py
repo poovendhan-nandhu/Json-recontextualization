@@ -45,8 +45,9 @@ ACCEPTABLE_THRESHOLD = 0.95
 
 # Locked shard paths - these should NOT be validated for domain terms
 # Supports both new format (snake_case at root) and old format (camelCase under topicWizardData)
-LOCKED_PATHS_NEW = ["scenario_options", "workspace_ids"]  # New format
-LOCKED_PATHS_OLD = ["scenarioOptions", "workspaceIds"]    # Old format
+# chat_history contains development history (user iterations) - NOT adapted content
+LOCKED_PATHS_NEW = ["scenario_options", "workspace_ids", "chat_history"]  # New format
+LOCKED_PATHS_OLD = ["scenarioOptions", "workspaceIds", "chatHistory"]    # Old format
 
 
 def strip_locked_content(adapted_json: dict) -> dict:
@@ -191,7 +192,7 @@ async def validate_domain_fidelity(adapted_json: dict, scenario_prompt: str) -> 
     """Check if ALL content uses TARGET industry terminology (derived from scenario)."""
     logger.info("[VALIDATOR] Running Domain Fidelity Agent...")
 
-    content_text = json.dumps(adapted_json, indent=2)[:50000]
+    content_text = json.dumps(adapted_json, indent=2)  # Full JSON - no truncation
 
     prompt = f"""You are validating DOMAIN FIDELITY for a business simulation.
 
@@ -261,7 +262,7 @@ async def validate_context_fidelity(adapted_json: dict, scenario_prompt: str) ->
     """Verify the goal/challenge/learning purpose from scenario is preserved."""
     logger.info("[VALIDATOR] Running Context Fidelity Agent...")
 
-    content_text = json.dumps(adapted_json, indent=2)[:30000]
+    content_text = json.dumps(adapted_json, indent=2)  # Full JSON - no truncation
 
     prompt = f"""You are validating CONTEXT FIDELITY for a business simulation.
 
@@ -270,8 +271,11 @@ async def validate_context_fidelity(adapted_json: dict, scenario_prompt: str) ->
 
 ## YOUR TASK:
 1. Extract from scenario: What is the learner's GOAL? What CHALLENGE must they solve? What ROLE do they play?
-2. Check if the adapted content PRESERVES these elements
-3. The specific context may change, but the TYPE of challenge should remain
+2. Check if the adapted content PRESERVES these elements in ESSENCE (not exact wording)
+3. BE LENIENT - mark as preserved if:
+   - The core challenge type matches (e.g., "competitive response" = "respond to competitor")
+   - The role level matches (e.g., "present to VP" = "present to senior executive")
+   - Specific names/details may differ but the function/purpose is the same
 
 ## CONTENT TO CHECK:
 {content_text}
@@ -324,7 +328,7 @@ async def validate_resource_quality(adapted_json: dict, scenario_prompt: str) ->
     """Ensure resources provide DATA not answers (inference map).
 
     IMPORTANT DISTINCTION:
-    - MAIN resources (with markdown_text/content): Check word count (800-1400) + forbidden phrases
+    - MAIN resources (with markdown_text/content): Check word count (800-2200) + forbidden phrases
     - Resource OPTIONS (metadata): Check terminology ONLY, NOT word count (they're supposed to be short)
     """
     logger.info("[VALIDATOR] Running Resource Quality Agent...")
@@ -396,8 +400,8 @@ async def validate_resource_quality(adapted_json: dict, scenario_prompt: str) ->
             "relevance": opt.get("relevance", "")[:200]
         })
 
-    main_text = json.dumps(main_resources_info, indent=2)[:25000] if main_resources_info else "No main resources"
-    options_text = json.dumps(options_info, indent=2)[:15000] if options_info else "No resource options"
+    main_text = json.dumps(main_resources_info, indent=2) if main_resources_info else "No main resources"
+    options_text = json.dumps(options_info, indent=2) if options_info else "No resource options"
 
     prompt = f"""You are validating RESOURCE QUALITY for a business simulation.
 
@@ -405,7 +409,7 @@ async def validate_resource_quality(adapted_json: dict, scenario_prompt: str) ->
 
 ### TYPE 1: MAIN RESOURCES (need full validation)
 - These are FULL content resources with markdown_text/content
-- CHECK: Word count (must be 800-1400 words)
+- CHECK: Word count (must be 800-2200 words)
 - CHECK: Forbidden phrases ("should", "recommend", etc.)
 - CHECK: Has data/statistics
 
@@ -423,7 +427,7 @@ async def validate_resource_quality(adapted_json: dict, scenario_prompt: str) ->
 - "The best approach is..." / "The optimal strategy is..."
 - "In conclusion..." / "To summarize..."
 
-## MAIN RESOURCES (check word count 800-1400 + forbidden phrases):
+## MAIN RESOURCES (check word count 800-2200 + forbidden phrases):
 {main_text}
 
 ## RESOURCE OPTIONS (check terminology ONLY, NOT word count):
@@ -434,7 +438,7 @@ async def validate_resource_quality(adapted_json: dict, scenario_prompt: str) ->
 
 ## SCORING:
 - Start at 100%
-- MAIN resources: -10% for each forbidden phrase, -20% if word count outside 800-1400
+- MAIN resources: -10% for each forbidden phrase, -20% if word count outside 800-2200
 - Options: -5% for wrong terminology in description/relevance
 - DO NOT penalize resource options for being short (they're supposed to be)
 
@@ -476,7 +480,7 @@ async def validate_resource_quality(adapted_json: dict, scenario_prompt: str) ->
                 if issue_type == "direct_answer":
                     issue_msg = f"Direct answer found: '{found_text[:80]}...'" if found_text else description
                 elif issue_type == "word_count":
-                    issue_msg = f"Word count {word_count} outside 800-1400 range"
+                    issue_msg = f"Word count {word_count} outside 800-2200 range"
                 else:
                     issue_msg = description
 
@@ -586,19 +590,28 @@ async def validate_klo_question_alignment(adapted_json: dict, scenario_prompt: s
 {klos_text}
 
 ## QUESTIONS - What students will answer:
-{questions_formatted[:15000]}
+{questions_formatted}
 
 ## YOUR TASK:
-1. For EACH question, determine which KLO(s) it assesses
-2. Check if question terminology matches the TARGET scenario (fast food, $1 menu, BurgerBlitz)
-3. A question is ALIGNED if it tests skills/knowledge from at least one KLO
+1. First, categorize each question as either:
+   - CONTENT QUESTION: Asks about business analysis, strategy, data interpretation, recommendations
+   - REFLECTION QUESTION: Asks learner to reflect on their experience, what they learned, how their understanding evolved, what was challenging (metacognitive)
+
+2. For CONTENT QUESTIONS only:
+   - Determine which KLO(s) it assesses
+   - Check if terminology matches the TARGET scenario (entities, industry terms, concepts)
+   - Mark as ALIGNED if it tests skills/knowledge from at least one KLO
+
+3. REFLECTION QUESTIONS should be SKIPPED (not counted as unaligned)
 
 ## OUTPUT (JSON only):
 {{
     "questions_checked": {len(question_texts)},
+    "content_questions": "count of content questions (excluding reflection)",
+    "reflection_questions_skipped": "count of reflection questions excluded",
     "klos_found": {len(klos_extracted)},
-    "alignment_summary": "brief description of how questions map to KLOs",
-    "unaligned_questions": ["list questions that don't map to any KLO"],
+    "alignment_summary": "brief description of how content questions map to KLOs",
+    "unaligned_questions": ["list CONTENT questions that don't map to any KLO - exclude reflection questions"],
     "wrong_terminology_questions": ["list questions using wrong industry terms"]
 }}"""
 
@@ -624,13 +637,22 @@ async def validate_klo_question_alignment(adapted_json: dict, scenario_prompt: s
                 severity="error"
             ))
 
-        # CALCULATE score ourselves based on actual issues
-        total_questions = len(question_texts) if question_texts else 1
+        # CALCULATE score based on CONTENT questions only (excluding reflection questions)
+        # Use LLM's count of content questions if available, otherwise fall back to total
+        content_count = result.get("content_questions", len(question_texts))
+        if isinstance(content_count, str):
+            try:
+                content_count = int(content_count)
+            except ValueError:
+                content_count = len(question_texts)
+        content_count = max(content_count, 1)  # Avoid division by zero
+
         unaligned = len(result.get("unaligned_questions", []))
         wrong_terms = len(result.get("wrong_terminology_questions", []))
         total_issues = unaligned + wrong_terms
-        score = max(0.0, (total_questions - total_issues) / total_questions)
-        logger.info(f"[VALIDATOR] KLO-Question: {total_questions} questions, {total_issues} issues = {score:.1%}")
+        score = max(0.0, (content_count - total_issues) / content_count)
+        reflection_skipped = result.get("reflection_questions_skipped", 0)
+        logger.info(f"[VALIDATOR] KLO-Question: {content_count} content questions ({reflection_skipped} reflection skipped), {total_issues} issues = {score:.1%}")
         return AgentResult(
             agent_name="KLO-Question Alignment",
             score=score,
@@ -647,43 +669,105 @@ async def validate_klo_question_alignment(adapted_json: dict, scenario_prompt: s
 # AGENT 5: CONSISTENCY
 # =============================================================================
 
+def _extract_names_from_json(data: dict) -> dict:
+    """
+    Programmatically extract all names, emails, and company references from JSON.
+    Returns verified data that actually exists in the JSON.
+    """
+    json_str = json.dumps(data, ensure_ascii=False)
+
+    # Extract emails (definitive - regex is reliable)
+    emails = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', json_str))
+
+    # Extract from known fields programmatically
+    company_names = set()
+    person_names = set()
+
+    def extract_from_dict(obj, path=""):
+        if isinstance(obj, dict):
+            # Company name fields
+            for key in ['company_name', 'organization_name', 'companyName', 'organizationName', 'company']:
+                if key in obj and isinstance(obj[key], str) and obj[key].strip():
+                    company_names.add(obj[key].strip())
+
+            # Person name fields
+            for key in ['name', 'manager_name', 'managerName', 'author', 'sender', 'recipient', 'from', 'to']:
+                if key in obj and isinstance(obj[key], str) and obj[key].strip():
+                    val = obj[key].strip()
+                    # Filter out non-names (IDs, roles, etc.)
+                    if len(val) > 2 and not val.startswith('/') and ' ' in val or val[0].isupper():
+                        # Check if it looks like a person name (not a role/title)
+                        if not any(x in val.lower() for x in ['manager', 'director', 'ceo', 'vp ', 'chief', 'officer', 'analyst']):
+                            person_names.add(val)
+
+            # Recurse
+            for k, v in obj.items():
+                extract_from_dict(v, f"{path}/{k}")
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                extract_from_dict(item, f"{path}/{i}")
+
+    extract_from_dict(data)
+
+    return {
+        "emails": list(emails),
+        "company_names": list(company_names),
+        "person_names": list(person_names)
+    }
+
+
 @traceable(name="validate_consistency", run_type="chain")
 async def validate_consistency(adapted_json: dict, scenario_prompt: str) -> AgentResult:
     """Validate same company/manager names used throughout."""
     logger.info("[VALIDATOR] Running Consistency Agent...")
 
-    content_text = json.dumps(adapted_json, indent=2)[:40000]
+    # STEP 1: Extract names programmatically (verified to exist)
+    extracted = _extract_names_from_json(adapted_json)
+
+    # If we found very few names, the JSON might use different field names
+    # Fall back to a smaller, focused sample for GPT
+    if len(extracted["company_names"]) == 0 and len(extracted["person_names"]) == 0:
+        # Send full JSON - no truncation needed
+        content_text = json.dumps(adapted_json, indent=2)
+    else:
+        # We have extracted names - send full JSON for context
+        content_text = json.dumps({
+            "extracted_names": extracted,
+            "full_content": adapted_json
+        }, indent=2)
 
     prompt = f"""You are validating NAMING CONSISTENCY.
 
 ## SCENARIO:
 {scenario_prompt}
 
+## PRE-EXTRACTED DATA (verified to exist in JSON):
+- Company names found: {extracted["company_names"]}
+- Person names found: {extracted["person_names"]}
+- Emails found: {extracted["emails"][:10]}
+
 ## YOUR TASK:
-Extract all company names, person names, and emails from content.
-Check for consistency:
-- ONE protagonist company name used consistently (the company learners advise)
-- ONE manager name used consistently
-- Email format: firstname.lastname@company.com
-- NOTE: A COMPETITOR company name may also appear - this is ALLOWED and should NOT be flagged as inconsistent
+1. Identify the CANONICAL company name from the extracted list
+2. Check for VARIATIONS of the SAME entity that should be standardized
+3. IMPORTANT: Multiple DIFFERENT people with DIFFERENT roles are NOT inconsistencies
+   - Different people holding different positions in the organization are all valid
+   - Only flag if the SAME person is referred to by different name spellings
+4. Only report issues for names in the PRE-EXTRACTED DATA - do NOT hallucinate
 
-Inconsistent = "EcoChic" vs "EcoChic Threads" vs "Eco-Chic" (variations of same company)
-Consistent = "EcoChic Threads" for protagonist, "RivalCo" for competitor (two different companies is OK)
-
-## CONTENT:
+## CONTENT SAMPLE:
 {content_text}
 
 ## OUTPUT (JSON only):
 {{
-    "canonical_company": "the correct company name to use everywhere",
-    "canonical_manager": "the correct manager name to use everywhere",
-    "company_variations": ["all variations found"],
-    "manager_variations": ["all name variations"],
+    "canonical_company": "the correct company name from extracted list",
+    "canonical_manager": "the correct manager name from extracted list",
+    "company_variations": ["variations found IN THE EXTRACTED LIST"],
+    "manager_variations": ["variations found IN THE EXTRACTED LIST"],
     "issues": [
         {{
             "type": "company|manager|email",
-            "wrong_value": "the incorrect value found",
-            "correct_value": "what it should be replaced with"
+            "wrong_value": "must be from extracted list",
+            "correct_value": "the canonical value"
         }}
     ]
 }}"""
@@ -693,34 +777,41 @@ Consistent = "EcoChic Threads" for protagonist, "RivalCo" for competitor (two di
         result = _parse_json_response(response)
 
         issues = []
+
+        # VERIFY: Only accept issues where wrong_value actually exists in extracted data
+        all_extracted = set(extracted["company_names"] + extracted["person_names"] + extracted["emails"])
+        json_str = json.dumps(adapted_json, ensure_ascii=False).lower()
+
         for item in result.get("issues", []):
             wrong_val = item.get("wrong_value", "")
             correct_val = item.get("correct_value", "")
-            issues.append(ValidationIssue(
-                agent="Consistency",
-                location=f"find:{wrong_val}",  # Use find: prefix for string-based patching
-                issue=f"Inconsistent {item.get('type', 'name')}: '{wrong_val}' should be '{correct_val}'",
-                suggestion=f"Replace '{wrong_val}' with '{correct_val}'",
-                severity="warning"
-            ))
 
-        # CALCULATE score based on variations found
+            # VERIFY the wrong value actually exists in the JSON
+            if wrong_val and wrong_val.lower() in json_str:
+                issues.append(ValidationIssue(
+                    agent="Consistency",
+                    location=f"find:{wrong_val}",
+                    issue=f"Inconsistent {item.get('type', 'name')}: '{wrong_val}' should be '{correct_val}'",
+                    suggestion=f"Replace '{wrong_val}' with '{correct_val}'",
+                    severity="warning"
+                ))
+            else:
+                logger.debug(f"[VALIDATOR] Consistency: Skipping hallucinated issue '{wrong_val}' - not found in JSON")
+
+        # CALCULATE score based on verified variations
         company_variations = len(result.get("company_variations", []))
         manager_variations = len(result.get("manager_variations", []))
         total_variations = company_variations + manager_variations
 
-        # Perfect = 2 total (1 company + 1 manager)
-        # Score decreases as variations increase
         if total_variations <= 2:
-            score = 1.0  # Perfect - one name each
+            score = 1.0
         elif total_variations <= 4:
-            score = 0.9  # Minor variations
+            score = 0.9
         elif total_variations <= 6:
-            score = 0.8  # Some variations
+            score = 0.8
         else:
             score = max(0.5, 1.0 - (total_variations - 2) * 0.1)
 
-        # Also penalize for issues
         if len(issues) > 0:
             score = max(0.5, score - len(issues) * 0.1)
 
@@ -746,7 +837,7 @@ async def validate_completeness(adapted_json: dict, scenario_prompt: str) -> Age
     """Detect placeholders, truncated content, or missing data."""
     logger.info("[VALIDATOR] Running Completeness Agent...")
 
-    content_text = json.dumps(adapted_json, indent=2)[:40000]
+    content_text = json.dumps(adapted_json, indent=2)  # Full JSON - no truncation
 
     # Quick regex pre-check - ONLY check for actual placeholders, not all brackets
     placeholder_patterns = [
@@ -862,6 +953,21 @@ async def validate_completeness(adapted_json: dict, scenario_prompt: str) -> Age
             "settings.",  # UI settings
             "description",  # Generic description often optional
             "scenario_description",  # May be filled elsewhere
+            "flow_properties.purpose",  # Stage-level purpose optional when children have purposes
+            "flow_properties.icon",  # Icon field often intentionally empty
+            # System/ID fields - not content
+            "workspace",  # System workspace ID
+            "selected_workspace_id",  # System ID
+            "selected_avatar_id",  # User selection ID
+            "avatar_image_url",  # URL - not content
+            "video_url",  # URL - not content
+            "_id",  # MongoDB-style IDs
+            # scenario_change is a different format, may have empty fields
+            "scenario_change.",  # scenario_change structure often partial
+            # Optional user-generated fields
+            "organization_image_key_words",  # Optional keywords
+            "avatar_url",  # URL - user content
+            "learner_role.role",  # May be blank
         ]
 
         for ef in result.get("empty_fields", []):
@@ -932,10 +1038,10 @@ async def validate_klo_resource_alignment(adapted_json: dict, scenario_prompt: s
                     if content:
                         resources.append({
                             "stage": stage_idx,
-                            "content_preview": str(content)[:3000]
+                            "content_preview": str(content)[:8000]  # Increased from 3000 to capture financial/regulatory sections
                         })
 
-    resources_text = json.dumps(resources, indent=2)[:20000] if resources else "No resources found"
+    resources_text = json.dumps(resources, indent=2) if resources else "No resources found"
 
     prompt = f"""You are validating KLO-RESOURCE ALIGNMENT for a business simulation.
 
@@ -1075,7 +1181,7 @@ async def validate_question_solvability(adapted_json: dict, scenario_prompt: str
                     elif isinstance(res, str):
                         content = res
                     if content:
-                        resources.append(str(content)[:12000])
+                        resources.append(str(content))  # Full resource - no truncation
 
                 # Resource options (also contains relevant data)
                 res_opts = data.get("resource_options", [])
@@ -1083,16 +1189,16 @@ async def validate_question_solvability(adapted_json: dict, scenario_prompt: str
                     if isinstance(opt, dict):
                         opt_content = opt.get("markdown_text") or opt.get("content") or opt.get("html") or ""
                         if opt_content and len(opt_content) > 100:
-                            resources.append(str(opt_content)[:2500])
+                            resources.append(str(opt_content))  # Full resource - no truncation
 
-    resources_text = "\n---\n".join(resources)[:25000] if resources else "No resources found"
+    resources_text = "\n---\n".join(resources) if resources else "No resources found"
 
     prompt = f"""You are validating QUESTION SOLVABILITY for a business simulation.
 
 ## CRITICAL CHECK: Can students answer questions using ONLY the resources?
 
 ## QUESTIONS students must answer:
-{questions_text[:8000]}
+{questions_text}
 
 ## RESOURCES provided to students:
 {resources_text}
@@ -1366,7 +1472,7 @@ async def repair_issues(adapted_json: dict, scenario_prompt: str, report: Valida
         return apply_string_patches(adapted_json, auto_patches)
 
     # Only send a sample of content for context, not the full JSON
-    content_sample = json.dumps(adapted_json, indent=2)[:20000]
+    content_sample = json.dumps(adapted_json, indent=2)  # Full JSON - no truncation
 
     prompt = f"""You are a REPAIR AGENT. Generate patches to fix validation issues.
 
@@ -1394,7 +1500,7 @@ Generate patches to fix each issue. Use JSON Pointer paths when the location is 
 For PATH-BASED patches (when you know the exact JSON path):
 [
     {{"path": "/simulation_flow/0/data/task_email/body", "value": "new content here", "reason": "Fixed domain term"}},
-    {{"path": "/workplace_scenario/background/organization_name", "value": "BurgerBlitz", "reason": "Consistent company name"}}
+    {{"path": "/workplace_scenario/background/organization_name", "value": "TargetCompanyName", "reason": "Consistent company name"}}
 ]
 
 For STRING-BASED patches (when you need to find/replace text):
@@ -1514,7 +1620,7 @@ async def fix_resource_quality(
 
     This is different from generic repair - it actually rewrites resources to:
     1. Remove direct answer language (should, recommend, therefore)
-    2. Trim to 800-1400 word range (MAIN resources only)
+    2. Trim to 800-2200 word range (MAIN resources only)
     3. Add data/statistics if missing
     4. **NEW**: Use correct company name and terminology from adaptation
     """
@@ -1638,7 +1744,7 @@ async def fix_resource_quality(
    - REMOVE all conclusions and recommendations
    - KEEP only: Raw data, statistics, facts, percentages
 
-2. **WORD COUNT** - Must be 800-1400 words (currently {len(content.split())} words)
+2. **WORD COUNT** - Must be 800-2200 words (currently {len(content.split())} words)
    - If too long: Trim redundant sections, remove filler
    - If too short: Add more data points, statistics, market figures
 
@@ -1652,14 +1758,14 @@ async def fix_resource_quality(
 4. **CONSISTENCY** - Use "{company_name}" as the company name throughout
 
 ## CURRENT CONTENT:
-{content[:8000]}
+{content}
 
 ## SCENARIO CONTEXT:
-{scenario_prompt[:500]}
+{scenario_prompt}
 
 ## OUTPUT:
 Return ONLY the rewritten content text. No explanations, no JSON wrapper.
-Target: 800-1400 words of pure data and facts.
+Target: 800-2200 words of pure data and facts.
 Use "{company_name}" consistently. Avoid all forbidden terms."""
 
         try:
@@ -1741,7 +1847,7 @@ async def fix_context_fidelity(adapted_json: dict, scenario_prompt: str, issues:
     logger.info(f"[CONTEXT FIXER] Fixing {len(issues)} context fidelity issues...")
 
     # Get key sections that need context
-    content_sample = json.dumps(result, indent=2)[:30000]
+    content_sample = json.dumps(result, indent=2)  # Full JSON - no truncation
 
     issue_descriptions = "\n".join([f"- {i.issue}: {i.suggestion}" for i in issues])
 

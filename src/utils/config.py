@@ -185,6 +185,17 @@ SHARD_DEFINITIONS: dict[str, ShardDefinition] = {
         "parallel": True,
         "aligns_with": ["workplace_scenario"],
     },
+    "industry_activities": {
+        "name": "Industry Aligned Activities",
+        "paths": [
+            "industry_aligned_activities",
+            "selected_industry_aligned_activities",
+        ],
+        "locked": False,  # MUST be adapted - contains source domain activities
+        "is_blocker": False,
+        "parallel": True,
+        "aligns_with": ["workplace_scenario", "assessment_criteria"],
+    },
 }
 
 
